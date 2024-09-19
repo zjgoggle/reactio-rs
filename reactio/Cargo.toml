@@ -7,3 +7,4 @@ edition = "2021"
 
 [dependencies]
 polling = "3.7"
+libc = "0.2"

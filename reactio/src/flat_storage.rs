@@ -1,5 +1,5 @@
-/// FlatStorage works similar to map. Each element is assigned a key (or index) of usize type when inserting to FlatStorage.
-/// the ID can be used to read/modify/remove the element.
+/// FlatStorage works similar to map. Each element is assigned an ID/key (or index in Vec) of usize type when inserting to FlatStorage.
+/// The ID/key can be used to read/modify/remove the element.
 /// Users can use it to create link list or just use it as a container.
 pub struct FlatStorage<T> {
     data: Vec<AllocNode<T>>,
