@@ -1,4 +1,4 @@
-use crate::dbglog; // import one macro per line.
+use crate::dbglog; // import one macro per line. macros are exported at root of crate instead of mod level.
 use crate::flat_storage::FlatStorage;
 use crate::logmsg;
 use crate::utils;
@@ -10,8 +10,6 @@ pub trait TcpStreamHandler {
     fn on_connected(&mut self, sock: &mut std::net::TcpStream) -> bool;
     /// \return false to close socket.
     fn on_readable(&mut self, sock: &mut std::net::TcpStream) -> bool;
-
-    // fn on_remove(self, conn: &std::net::TcpStream);
 }
 
 pub trait TcpListenerHandler {
@@ -22,8 +20,6 @@ pub trait TcpListenerHandler {
         new_sock: &mut std::net::TcpStream,
         addr: std::net::SocketAddr,
     ) -> Option<Box<dyn TcpStreamHandler>>;
-
-    // fn on_remove(self, conn: &std::net::TcpListener);
 }
 
 /// SocketPoller manages TCP connections & polling.
@@ -351,12 +347,13 @@ pub mod sample {
                 &self.single_trip_durations[..],
                 self.single_trip_durations.len(),
             );
+            let fact = 1;
             println!(
                 "SingleTrip        {}       {}      {}      {}",
-                d[0] / 1000,
-                d[n / 2] / 1000,
-                d[(n as f32 * 0.99) as usize] / 1000,
-                d[n - 2] / 1000
+                d[0] / fact,
+                d[n / 2] / fact,
+                d[(n as f32 * 0.99) as usize] / fact,
+                d[n - 2] / fact
             );
 
             let (d, n) = (
@@ -365,10 +362,10 @@ pub mod sample {
             );
             println!(
                 "RoundTrip         {}       {}      {}      {}",
-                d[0] / 1000,
-                d[n / 2] / 1000,
-                d[(n as f32 * 0.99) as usize] / 1000,
-                d[n - 2] / 1000
+                d[0] / fact,
+                d[n / 2] / fact,
+                d[(n as f32 * 0.99) as usize] / fact,
+                d[n - 2] / fact
             );
             self.single_trip_durations.clear();
             self.round_trip_durations.clear();
@@ -407,12 +404,12 @@ pub mod sample {
                         }
                         let recvtime = utils::now_nanos();
                         if self.count_echo < self.max_echo {
-                            dbglog!("sock: {:?} recv bytes: {}, will echo back.", sock, nbytes);
+                            // dbglog!("sock: {:?} recv bytes: {}, will echo back.", sock, nbytes);
                             // decode message header
                             debug_assert!(nbytes >= MSG_HEADER_SIZE);
                             {
-                                let header: &mut MsgHeader =
-                                    utils::bytes_to_ref_mut(&mut self.recv_buf[0..10]);
+                                let header: &MsgHeader =
+                                    utils::bytes_to_ref(&self.recv_buf[0..MSG_HEADER_SIZE]);
                                 debug_assert_eq!(
                                     header.body_len as usize,
                                     nbytes - MSG_HEADER_SIZE
@@ -422,6 +419,7 @@ pub mod sample {
                                     self.round_trip_durations
                                         .push(recvtime - self.last_sent_time);
                                     self.single_trip_durations.push(recvtime - header.send_time);
+                                    // logmsg!("[{}, {}, {}] content: {} <{}>", self.last_sent_time, header.send_time, recvtime, nbytes-MSG_HEADER_SIZE, std::str::from_utf8(&self.recv_buf[MSG_HEADER_SIZE..]).unwrap());
                                 }
                             }
                             // here drop header because report_latencies is one more but borrow.
