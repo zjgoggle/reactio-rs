@@ -2,9 +2,14 @@ use crate::dbglog; // import one macro per line. macros are exported at root of 
 use crate::flat_storage::FlatStorage;
 use crate::logmsg;
 use crate::utils;
-use polling::{Event, Events, PollMode, Poller};
+use polling::{Event, Events, PollMode, Poller}; // TODO : investigate whether polling has implemented Poller with IOCP correctly ???
+use std::io::{ErrorKind, Read};
 use std::time::Duration;
 use std::{marker::PhantomData, net::TcpStream};
+
+//====================================================================================
+//            Poller
+//====================================================================================
 
 pub trait TcpStreamHandler {
     fn on_connected(&mut self, sock: &mut std::net::TcpStream) -> bool;
@@ -94,7 +99,7 @@ impl TcpConnections {
         SocketKey(key)
     }
 
-    pub fn remove_by_key(&mut self, key: SocketKey) {
+    pub fn close_by_key(&mut self, key: SocketKey) {
         if let Some(sockhandler) = self.socket_handlers.get_mut(key.0) {
             match *sockhandler {
                 TcpSocketHandler::StreamType(ref mut sock, _) => {
@@ -214,13 +219,140 @@ impl SocketPoller {
                 removesock = true;
             }
             if removesock {
-                self.connections.remove_by_key(SocketKey(ev.key));
+                self.connections.close_by_key(SocketKey(ev.key));
             }
         }
 
         return !self.events.is_empty();
     }
 }
+
+//====================================================================================
+//            MsgReader
+//====================================================================================
+
+pub trait MsgDispatcher {
+    /// dispatch msg.
+    /// @param msg_size  the decoded message size which is return value of previous call of dispatch. 0 means message having not been decoded.
+    /// @return ExpectMsgSize(msgsize) to indicate more read until full msgsize is read then call next dispatch. msgsize==0 means msg size is unknown.
+    ///         DropMsgSize(msgsize) to indiciate message is processed already. framework can drop the message after call. then msgsize will be 0 again.
+    fn dispatch(
+        &mut self,
+        buf: &mut [u8],
+        msg_size: usize,
+        sock: &mut std::net::TcpStream,
+    ) -> DispatchResult;
+}
+pub enum DispatchResult {
+    ExpectMsgSize(usize), // expecting more read, indicating expected size, dispatcher will not be called until specified msg bytes are read. size==0 means unknown size.
+    DropMsgSize(usize),   // msg has been dispatched, indicating bytes to drop.
+}
+
+/// Framework should repeatedly call MsgReader::try_read() to read messages from a sock into a recv_buffer and calls dispatcher to dispatch message.
+///
+pub struct MsgReader {
+    recv_buffer: Vec<u8>,
+    min_reserve: usize,
+    startpos: usize,        // msg start position or first effective byte.
+    bufsize: usize,         // count from buffer[0] to last read byte.
+    decoded_msgsize: usize, // decoded msg size from DispatchResult::ExpectMsgSize,
+}
+
+impl MsgReader {
+    pub fn new(min_recv_buf_reserve: usize) -> Self {
+        Self {
+            // dispatcher : dispatch,
+            recv_buffer: Vec::new(),
+            min_reserve: min_recv_buf_reserve,
+            startpos: 0,
+            bufsize: 0,
+            decoded_msgsize: 0,
+        }
+    }
+
+    /// On each new read, call callback dispatcher: (buffer, msg_size, sock) -> DispatchResult
+    /// @param msg_size  the decoded message size which is return value of previous call of dispatch. 0 means message having not been decoded.
+    /// @return ExpectMsgSize(msgsize) to indicate more read until full msgsize is read then call next dispatch. msgsize==0 means msg size is unknown.
+    ///         DropMsgSize(msgsize) to indiciate message is processed already. framework can drop the message after call. then msgsize will be 0 again.
+    /// 
+    fn try_read(
+        &mut self,
+        sock: &mut std::net::TcpStream,
+        dispatcher: &mut impl MsgDispatcher,
+    ) -> bool {
+        loop {
+            debug_assert!(
+                self.decoded_msgsize == 0 || self.decoded_msgsize > self.bufsize - self.startpos
+            ); // msg size is not decoded, or have not received expected msg size.
+
+            if self.bufsize + self.min_reserve > self.recv_buffer.len() {
+                self.recv_buffer.resize(self.bufsize + self.min_reserve, 0);
+            }
+            match sock.read(&mut self.recv_buffer[self.bufsize..]) {
+                std::io::Result::Ok(nbytes) => {
+                    if nbytes == 0 {
+                        logmsg!("peer closed sock: {:?}", sock);
+                        return false;
+                    }
+                    debug_assert!(self.bufsize + nbytes <= self.recv_buffer.len());
+
+                    self.bufsize += nbytes;
+                    let should_return = self.bufsize < self.recv_buffer.len(); // not full, no need to retry this time.
+                    while self.startpos < self.bufsize
+                        && (self.decoded_msgsize == 0
+                            || self.startpos + self.decoded_msgsize <= self.bufsize)
+                    {
+                        match dispatcher.dispatch(
+                            &mut self.recv_buffer[self.startpos..self.bufsize],
+                            self.decoded_msgsize,
+                            sock,
+                        ) {
+                            DispatchResult::ExpectMsgSize(msgsize) => {
+                                assert!(msgsize == 0 || msgsize > self.bufsize - self.startpos, "{msgsize:?} startpos:{} bufsize: {}", self.startpos, self.bufsize); // either unknown msg size, or partial msg.
+                                self.decoded_msgsize = msgsize; // could be 0 if msg size is unknown.
+                            }
+                            DispatchResult::DropMsgSize(msgsize) => {
+                                assert!(msgsize > 0 && msgsize <= self.bufsize - self.startpos); // drop size should not exceed buffer size.
+                                self.startpos += msgsize;
+                                self.decoded_msgsize = 0;
+                            }
+                        }
+                    }
+                    if self.startpos != 0 {
+                        // move front
+                        self.recv_buffer.copy_within(self.startpos..self.bufsize, 0);
+                        self.bufsize -= self.startpos;
+                        self.startpos = 0;
+                    }
+                    if should_return {
+                        // not full.
+                        return true; // wait for next readable.
+                    } else {
+                        continue; // try next read.
+                    }
+                }
+                std::io::Result::Err(err) => {
+                    let errkind = err.kind();
+                    if errkind == ErrorKind::WouldBlock {
+                        return true; // wait for next readable.
+                    } else if errkind == ErrorKind::ConnectionReset {
+                        logmsg!("sock reset : {sock:?}");
+                        return false; // socket closed
+                    }
+                    logmsg!("ERROR: read on sock {sock:?}, error: {err:?}");
+                    return false;
+                }
+            }
+        }
+    }
+}
+//====================================================================================
+//            MsgSender
+//====================================================================================
+
+// pub fn blocking_send(_buf: &mut [u8]) {
+//     //TODO:
+// }
 
 //====================================================================================
 //         Default TcpListenerHandler
@@ -256,39 +388,12 @@ impl<StreamHandler: TcpStreamHandler + Default + 'static> TcpListenerHandler
     }
 }
 
-// enum IOResult {
-//     Ok(usize), // bytes > 0
-//     WouldBlock,
-//     Closed,  // peer closed
-//     Error(std::io::Error),
-// }
-// /// read all remaining bytes from unblocking socket.
-// /// \note sock must be set nonblocking before calling this function.
-// pub fn tcp_read(sock: &std::net::TcpStream, buf: &mut [u8]) -> IOResult {
-//     match sock.read(&mut buf) {
-//         io::Result::Ok(nbytes) => {
-//             if nbytes == 0 {
-//                 println!("peer closed sock: {:?}", sock);
-//                 return IOResult::Closed;
-//             }
-//             if nbytes < self.recv_buf.len() {
-//                 return IOResult::Ok(nbytes); // no more data
-//             }
-//         },
-//         io::Result::Err(err) => {
-//             let errkind = err.kind();
-//             if errkind == ErrorKind::WouldBlock {
-//                 return IOResult::WouldBlock;
-//             } else if errkind == ErrorKind::ConnectionReset {
-//                 return IOResult::Closed;
-//             }
-//             return IOResult::Error(err);
-//         }
-//     }
-// }
+//====================================================================================
+//            TcpEchoHandler
+//====================================================================================
 
 pub mod sample {
-    use std::io::{ErrorKind, Read, Write};
+    use std::io::{Write};
 
     use super::*;
 
@@ -298,44 +403,80 @@ pub mod sample {
         send_time: i64, // sending timestamp nanos since epoch
     }
     const MSG_HEADER_SIZE: usize = 10;
-    const RECV_BUFFER_SIZE: usize = 1024;
+    const MIN_RECV_BUFFER_SIZE: usize = 1024;
     const LATENCY_BATCH_SIZE: i32 = 10000;
 
     pub struct TcpEchoHandler {
-        recv_buf: Vec<u8>,
-        is_client: bool, // default false
-        max_echo: i32,
-        count_echo: i32,
+        reader: MsgReader,
+        dispatcher: EchoAndLatency, // reader & dispacther must be decoupled, in order to avoid double mutable reference of self.
+    }
 
-        latency_batch: i32, // number of messages to report latencies.
-        last_sent_time: i64,
-        single_trip_durations: Vec<i64>,
-        round_trip_durations: Vec<i64>,
+    /// EchoAndLatency reports latency and echo back.
+    /// It's owned by TcpEchoHandler/TcpStreamHandler, which also owns a MsgReader that calls EchoAndLatency::dispatch.
+    /// MsgReader & MsgDispatcher must be decoupled.
+    /// See issue: https://stackoverflow.com/questions/79015535/could-anybody-optimize-class-design-and-fix-issue-mutable-more-than-once-at-a-t
+    struct EchoAndLatency {
+        pub is_client: bool, // default false
+        pub max_echo: i32,
+        pub count_echo: i32,
+
+        pub latency_batch: i32, // number of messages to report latencies.
+        pub last_sent_time: i64,
+        pub single_trip_durations: Vec<i64>,
+        pub round_trip_durations: Vec<i64>,
     }
-    impl Default for TcpEchoHandler {
-        fn default() -> Self {
-            TcpEchoHandler::new(false, i32::MAX, LATENCY_BATCH_SIZE)
-        }
-    }
-    impl TcpEchoHandler {
-        pub fn new(isclient: bool, a_max_echo: i32, a_latency_batch: i32) -> Self {
-            Self {
-                recv_buf: vec![0u8; RECV_BUFFER_SIZE],
-                is_client: isclient,
-                max_echo: a_max_echo,
-                count_echo: 0,
-                latency_batch: a_latency_batch,
-                //
-                last_sent_time: 0,
-                single_trip_durations: Vec::new(),
-                round_trip_durations: Vec::new(),
+    impl MsgDispatcher for EchoAndLatency {
+        fn dispatch(
+                &mut self,
+                buf: &mut [u8],
+                msg_size: usize,
+                sock: &mut std::net::TcpStream,
+            ) -> DispatchResult {
+            let mut msg_size = msg_size;
+            if msg_size == 0 {
+                // decode header
+                if buf.len() < MSG_HEADER_SIZE {
+                    return DispatchResult::ExpectMsgSize(0); // partial header
+                }
+                let header: &MsgHeader = utils::bytes_to_ref(&buf[0..MSG_HEADER_SIZE]);
+                msg_size = header.body_len as usize + MSG_HEADER_SIZE;
+
+                if msg_size > buf.len() {
+                    return DispatchResult::ExpectMsgSize(msg_size); // decoded msg_size but still partial msg. need reading more.
+                } // else has read full msg.
             }
-        }
+            debug_assert!(buf.len() >= msg_size); // full msg.
+                                                  //---- process full message.
+            let recvtime = utils::now_nanos();
+            {
+                let header: &MsgHeader = utils::bytes_to_ref(&buf[0..MSG_HEADER_SIZE]);
+                debug_assert_eq!(header.body_len as usize + MSG_HEADER_SIZE, buf.len());
 
-        pub fn new_client(max_echo: i32, latency_batch: i32) -> Box<Self> {
-            Box::new(Self::new(true, max_echo, latency_batch))
-        }
+                if self.last_sent_time > 0 {
+                    self.round_trip_durations
+                        .push(recvtime - self.last_sent_time);
+                    self.single_trip_durations.push(recvtime - header.send_time);
+                    dbglog!("[{}, {}, {}] content: {} <{}>", self.last_sent_time, header.send_time, recvtime, buf.len(), std::str::from_utf8(&buf[MSG_HEADER_SIZE..]).unwrap());
+                }
+            }
+            // here drop header because report_latencies is one more but borrow.
+            if self.round_trip_durations.len() as i32 == self.latency_batch {
+                self.report_latencies();
+            }
+            let header: &mut MsgHeader = utils::bytes_to_ref_mut(&mut buf[0..MSG_HEADER_SIZE]);
+            header.send_time = utils::now_nanos(); // update send_time only
 
+            if self.count_echo < self.max_echo {
+                let nsent = sock.write(&buf[..msg_size]).unwrap();
+                debug_assert_eq!(nsent, msg_size);
+                self.last_sent_time = utils::now_nanos();
+
+                self.count_echo += 1;
+            }
+            return DispatchResult::DropMsgSize(msg_size);
+        }
+    }
+    impl EchoAndLatency {
         fn report_latencies(&mut self) {
             println!(
                 "Latencies(us) size: {} min      50%       99%     max",
@@ -371,21 +512,49 @@ pub mod sample {
             self.round_trip_durations.clear();
         }
     }
+
+    impl Default for TcpEchoHandler {
+        fn default() -> Self {
+            TcpEchoHandler::new(false, i32::MAX, LATENCY_BATCH_SIZE)
+        }
+    }
+    impl TcpEchoHandler {
+        pub fn new(isclient: bool, a_max_echo: i32, a_latency_batch: i32) -> Self {
+            Self {
+                reader: MsgReader::new(MIN_RECV_BUFFER_SIZE),
+                dispatcher: EchoAndLatency {
+                    is_client: isclient,
+                    max_echo: a_max_echo,
+                    count_echo: 0,
+                    latency_batch: a_latency_batch,
+                    //
+                    last_sent_time: 0,
+                    single_trip_durations: Vec::new(),
+                    round_trip_durations: Vec::new(),
+                },
+            }
+        }
+
+        pub fn new_client(max_echo: i32, latency_batch: i32) -> Box<Self> {
+            Box::new(Self::new(true, max_echo, latency_batch))
+        }
+    }
+
     impl TcpStreamHandler for TcpEchoHandler {
         fn on_connected(&mut self, sock: &mut std::net::TcpStream) -> bool {
-            if self.is_client {
+            if self.dispatcher.is_client {
                 logmsg!("client sock: {:?} connected.", sock);
                 let msg_content = b"test msg00";
-                debug_assert!(msg_content.len() + MSG_HEADER_SIZE < RECV_BUFFER_SIZE);
+                let mut buf = vec![0u8; msg_content.len() + MSG_HEADER_SIZE];
 
-                self.recv_buf[10..(10 + msg_content.len())].copy_from_slice(&msg_content[..]);
-                let header: &mut MsgHeader = utils::bytes_to_ref_mut(&mut self.recv_buf[0..10]);
+                buf[MSG_HEADER_SIZE..(MSG_HEADER_SIZE + msg_content.len())].copy_from_slice(&msg_content[..]);
+                let header: &mut MsgHeader = utils::bytes_to_ref_mut(&mut buf[0..10]);
                 header.body_len = msg_content.len() as u16;
                 header.send_time = utils::now_nanos();
 
                 //
                 let nsent = sock
-                    .write(&self.recv_buf[..(msg_content.len() + MSG_HEADER_SIZE)])
+                    .write(&buf[..(msg_content.len() + MSG_HEADER_SIZE)])
                     .unwrap();
                 debug_assert_eq!(nsent, msg_content.len() + MSG_HEADER_SIZE);
                 dbglog!("client sent initial msg");
@@ -394,77 +563,23 @@ pub mod sample {
             }
             return true;
         }
+
         fn on_readable(&mut self, sock: &mut std::net::TcpStream) -> bool {
-            loop {
-                match sock.read(&mut self.recv_buf) {
-                    std::io::Result::Ok(nbytes) => {
-                        if nbytes == 0 {
-                            logmsg!("peer closed sock: {:?}", sock);
-                            return false;
-                        }
-                        let recvtime = utils::now_nanos();
-                        if self.count_echo < self.max_echo {
-                            // dbglog!("sock: {:?} recv bytes: {}, will echo back.", sock, nbytes);
-                            // decode message header
-                            debug_assert!(nbytes >= MSG_HEADER_SIZE);
-                            {
-                                let header: &MsgHeader =
-                                    utils::bytes_to_ref(&self.recv_buf[0..MSG_HEADER_SIZE]);
-                                debug_assert_eq!(
-                                    header.body_len as usize,
-                                    nbytes - MSG_HEADER_SIZE
-                                );
-
-                                if self.last_sent_time > 0 {
-                                    self.round_trip_durations
-                                        .push(recvtime - self.last_sent_time);
-                                    self.single_trip_durations.push(recvtime - header.send_time);
-                                    // logmsg!("[{}, {}, {}] content: {} <{}>", self.last_sent_time, header.send_time, recvtime, nbytes-MSG_HEADER_SIZE, std::str::from_utf8(&self.recv_buf[MSG_HEADER_SIZE..]).unwrap());
-                                }
-                            }
-                            // here drop header because report_latencies is one more but borrow.
-                            if self.round_trip_durations.len() as i32 == self.latency_batch {
-                                self.report_latencies();
-                            }
-                            let header: &mut MsgHeader =
-                                utils::bytes_to_ref_mut(&mut self.recv_buf[0..10]);
-                            header.send_time = utils::now_nanos(); // update send_time only
-
-                            let nsent = sock.write(&self.recv_buf[..nbytes]).unwrap();
-                            debug_assert_eq!(nsent, nbytes);
-                            self.last_sent_time = utils::now_nanos();
-
-                            self.count_echo += 1;
-                            if nbytes < self.recv_buf.len() {
-                                return true; // no more data
-                            }
-                            continue; // try next read until error or WouldBlock
-                        } else {
-                            logmsg!(
-                                "sock:{:?} recv bytes: {}, reached target. closing.",
-                                sock,
-                                nbytes
-                            );
-                            return false;
-                        }
-                    }
-                    std::io::Result::Err(err) => {
-                        let errkind = err.kind();
-                        if errkind == ErrorKind::WouldBlock {
-                            // println!("WouldBlock {sock:?}");
-                            return true;
-                        } else if errkind == ErrorKind::ConnectionReset {
-                            // closed
-                            return false;
-                        }
-                        logmsg!(
-                            "ERROR recv sock: {sock:?} error: {}, errkind: {errkind:?}",
-                            err
-                        );
-                        return false;
-                    }
-                }
+            if !self.reader.try_read(
+                sock,
+                &mut self.dispatcher,
+            ) {
+                return false; // error: close
             }
+            if self.dispatcher.count_echo >= self.dispatcher.max_echo {
+                logmsg!(
+                    "sock:{:?} reached max echo: {}. closing.",
+                    sock,
+                    self.dispatcher.max_echo
+                );
+                return false;
+            }
+            return true;
         }
     }
 }

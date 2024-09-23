@@ -112,7 +112,9 @@ macro_rules! logmsg {
 #[cfg(debug_assertions)]
 macro_rules! dbglog {
     ($( $args:expr ),*) => {
-        logmsg!( $( $args ),* );
+        let mut buf = [0u8; 40];
+        print!("[{}] [DBG] ", crate::utils::format_time(&mut buf, crate::utils::now_nanos(), 6, false));
+        println!( $( $args ),* );
     }
 }
 #[allow(unused_macros)]
@@ -126,7 +128,6 @@ macro_rules! dbglog {
 
 #[cfg(test)]
 mod test {
-    use crate::logmsg; // macros are exported at crate level only.
 
     #[test]
     pub fn test_reactio() {
