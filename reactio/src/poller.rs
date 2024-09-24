@@ -1,8 +1,11 @@
-use crate::dbglog; // import one macro per line. macros are exported at root of crate instead of mod level.
+use crate::dbglog;
+// import one macro per line. macros are exported at root of crate instead of mod level.
 use crate::flat_storage::FlatStorage;
 use crate::logmsg;
 use crate::utils;
-use polling::{Event, Events, PollMode, Poller}; // TODO : investigate whether polling has implemented Poller with IOCP correctly ???
+use polling::{Event, Events, PollMode, Poller};
+use std::io::Write;
+// TODO : investigate whether polling has implemented Poller with IOCP correctly ???
 use std::io::{ErrorKind, Read};
 use std::time::Duration;
 use std::{marker::PhantomData, net::TcpStream};
@@ -42,7 +45,7 @@ struct TcpConnections {
 
 enum TcpSocketHandler {
     ListenerType(std::net::TcpListener, Box<dyn TcpListenerHandler>), // <sock, handler, key_in_flat_storage>
-    StreamType(std::net::TcpStream, Box<dyn TcpStreamHandler>),
+    StreamType(std::net::TcpStream, Box<dyn TcpStreamHandler>, MsgSender),
 }
 
 pub struct SocketKey(usize); // identify a socket in TcpConnections.
@@ -65,10 +68,13 @@ impl TcpConnections {
         sock: std::net::TcpStream,
         handler: Box<dyn TcpStreamHandler>,
     ) -> SocketKey {
-        let key = self
-            .socket_handlers
-            .add(TcpSocketHandler::StreamType(sock, handler));
-        if let TcpSocketHandler::StreamType(ref sock, _) = self.socket_handlers.get(key).unwrap() {
+        let key = self.socket_handlers.add(TcpSocketHandler::StreamType(
+            sock,
+            handler,
+            MsgSender::new(),
+        ));
+        if let TcpSocketHandler::StreamType(ref sock, _, _) = self.socket_handlers.get(key).unwrap()
+        {
             unsafe {
                 self.poller
                     .add_with_mode(sock, Event::readable(key), PollMode::Level)
@@ -102,8 +108,13 @@ impl TcpConnections {
     pub fn close_by_key(&mut self, key: SocketKey) {
         if let Some(sockhandler) = self.socket_handlers.get_mut(key.0) {
             match *sockhandler {
-                TcpSocketHandler::StreamType(ref mut sock, _) => {
-                    logmsg!("removing key: {}, sock: {:?}", key.0, sock);
+                TcpSocketHandler::StreamType(ref mut sock, _, ref sender) => {
+                    logmsg!(
+                        "removing key: {}, sock: {:?}, pending_send_bytes: {}",
+                        key.0,
+                        sock,
+                        sender.buf.len()
+                    );
                     self.count_streams -= 1;
                     self.poller.delete(sock).unwrap();
                 }
@@ -187,10 +198,11 @@ impl SocketPoller {
 
         for ev in self.events.iter() {
             let mut removesock = false;
-            if ev.readable {
-                if let Some(sockhandler) = self.connections.socket_handlers.get_mut(ev.key) {
-                    match sockhandler {
-                        TcpSocketHandler::ListenerType(ref mut sock, ref mut handler) => {
+
+            if let Some(sockhandler) = self.connections.socket_handlers.get_mut(ev.key) {
+                match sockhandler {
+                    TcpSocketHandler::ListenerType(ref mut sock, ref mut handler) => {
+                        if ev.readable {
                             let (mut newsock, addr) = sock.accept().unwrap();
                             if let Some(mut newhandler) =
                                 handler.on_new_connection(sock, &mut newsock, addr)
@@ -202,14 +214,29 @@ impl SocketPoller {
                             }
                             // else newsock will auto destroy
                         }
-                        TcpSocketHandler::StreamType(ref mut sock, ref mut handler) => {
-                            removesock = !handler.on_readable(sock);
+                        if ev.writable {
+                            logmsg!("[ERROR] writable listener sock!");
+                            removesock = true;
                         }
                     }
-                } else {
-                    panic!("no event key!");
+                    TcpSocketHandler::StreamType(
+                        ref mut sock,
+                        ref mut handler,
+                        ref mut _sender,
+                    ) => {
+                        if ev.readable {
+                            removesock = !handler.on_readable(sock);
+                        }
+                        if ev.writable {
+                            // TODO, send remaining data in send_buf.
+                            dbglog!("[WARN] NOT implemented writable sock {:?}!", sock);
+                        }
+                    }
                 }
+            } else {
+                panic!("no event key!");
             }
+
             if ev.is_err().unwrap_or(false) {
                 logmsg!("WARN: socket error key: {}", ev.key);
                 removesock = true;
@@ -224,6 +251,175 @@ impl SocketPoller {
         }
 
         return !self.events.is_empty();
+    }
+}
+
+//====================================================================================
+//            MsgSender
+//====================================================================================
+
+/// MsgSender is a per-socket object try sending msg on a non-blocking socket. if it fails due to WOULDBLOCK,
+/// the unsent bytes are saved and register a Write insterest in poller, so that
+/// the remaining data will be scheduled to send on next Writeable event.
+struct MsgSender {
+    pub buf: Vec<u8>,
+    pub pending: FlatStorage<PendingSend>,
+    first_pending_id: usize, // the id in flat_storage, usize::MAX is invalid
+    last_pending_id: usize,  // the id in flat_storage, usize::MAX is invalid
+    pub bytes_sent: usize,   // total bytes having been sent. buf[0] is bytes_sent+1 byte to send.
+}
+struct PendingSend {
+    next_id: usize,  // the id in flat_storage
+    startpos: usize, // the first byte of message to sent in buf,
+    msgsize: usize,
+    completion: Box<dyn Fn()>, // notify write completion.
+}
+
+enum SendOrQueResult {
+    Complete,     // No message in queue
+    Queue,        // message in queue
+    CloseOrError, // close socket.
+}
+impl MsgSender {
+    pub fn new() -> Self {
+        Self {
+            buf: Vec::new(),
+            pending: FlatStorage::new(),
+            first_pending_id: usize::MAX,
+            last_pending_id: usize::MAX,
+            bytes_sent: 0,
+        }
+    }
+    pub fn send_or_que(
+        &mut self,
+        sock: &mut std::net::TcpStream,
+        buf: &[u8],
+        send_completion: impl Fn() + 'static,
+    ) -> SendOrQueResult {
+        if buf.is_empty() {
+            send_completion();
+            return SendOrQueResult::Complete;
+        }
+        if !self.buf.is_empty() {
+            self.queue_msg(buf, send_completion);
+            return SendOrQueResult::Queue;
+        }
+        // else try send. queue it if fails.
+        let mut sentbytes = 0;
+        match sock.write(buf) {
+            std::io::Result::Ok(bytes) => {
+                if bytes == 0 {
+                    logmsg!("[ERROR] sock 0 bytes {sock:?}. close socket");
+                    return SendOrQueResult::CloseOrError;
+                } else if bytes < buf.len() {
+                    sentbytes = bytes;
+                    // return SendOrQueResult::Queue; // queued
+                } else {
+                    send_completion();
+                    return SendOrQueResult::Complete; // sent
+                }
+            }
+            std::io::Result::Err(err) => {
+                let errkind = err.kind();
+                if errkind == ErrorKind::WouldBlock {
+                    // return SendOrQueResult::Queue; // queued
+                } else if errkind == ErrorKind::ConnectionReset {
+                    logmsg!("sock reset : {sock:?}. close socket");
+                    return SendOrQueResult::CloseOrError; // socket closed
+                } else if errkind == ErrorKind::Interrupted {
+                    logmsg!("[WARN] sock Interrupted : {sock:?}. retry");
+                    // TODO: queue
+                    // return SendOrQueResult::Queue; // Interrupted is not an error. queue
+                } else {
+                    logmsg!("[ERROR]: read on sock {sock:?}, error: {err:?}");
+                    return SendOrQueResult::CloseOrError;
+                }
+            }
+        }
+        //---- queue the remaining bytes
+        self.queue_msg(&buf[sentbytes..], send_completion);
+        return SendOrQueResult::Queue;
+    }
+
+    pub fn queue_msg(&mut self, buf: &[u8], send_completion: impl Fn() + 'static) {
+        let prev_id = self.last_pending_id;
+        self.last_pending_id = self.pending.add(PendingSend {
+            next_id: usize::MAX,
+            startpos: self.bytes_sent + self.buf.len(),
+            msgsize: buf.len(),
+            completion: Box::new(send_completion),
+        });
+        if let Some(prev) = self.pending.get_mut(prev_id) {
+            prev.next_id = self.last_pending_id;
+        }
+        self.buf.extend_from_slice(buf);
+    }
+
+    #[allow(unused_assignments)]
+    pub fn send_queued(&mut self, sock: &mut std::net::TcpStream) -> SendOrQueResult {
+        if self.buf.is_empty() {
+            return SendOrQueResult::Complete;
+        }
+        let mut sentbytes = 0;
+        match sock.write(&self.buf[..]) {
+            std::io::Result::Ok(bytes) => {
+                sentbytes = bytes;
+                if bytes == 0 {
+                    logmsg!("[ERROR] sock 0 bytes {sock:?}. close socket");
+                    return SendOrQueResult::CloseOrError;
+                }
+            }
+            std::io::Result::Err(err) => {
+                let errkind = err.kind();
+                if errkind == ErrorKind::WouldBlock {
+                    return SendOrQueResult::Queue; // queued
+                } else if errkind == ErrorKind::ConnectionReset {
+                    logmsg!("sock reset : {sock:?}. close socket");
+                    return SendOrQueResult::CloseOrError; // socket closed
+                } else if errkind == ErrorKind::Interrupted {
+                    logmsg!("[WARN] sock Interrupted : {sock:?}. retry");
+                    return SendOrQueResult::Queue; // Interrupted is not an error. queue
+                } else {
+                    logmsg!("[ERROR]: read on sock {sock:?}, error: {err:?}");
+                    return SendOrQueResult::CloseOrError;
+                }
+            }
+        }
+        //-- now sent some bytes. notify
+        let id = self.first_pending_id;
+        while id != usize::MAX {
+            let (mut sent, mut next_id) = (false, 0);
+            if let Some(pending) = self.pending.get_mut(id) {
+                if pending.startpos + pending.msgsize <= self.bytes_sent {
+                    // fulled sent
+                    sent = true;
+                    next_id = pending.next_id;
+                } else {
+                    // the first msg not being fully sent.
+                    pending.msgsize -= self.bytes_sent - pending.startpos;
+                    pending.startpos = self.bytes_sent;
+                    break;
+                }
+            } else {
+                panic!("invalid id");
+            }
+            if sent {
+                self.first_pending_id = next_id;
+                if let Some(pending) = self.pending.remove(id) {
+                    (pending.completion)();
+                }
+            }
+        }
+        //- move front buf
+        let len = self.buf.len();
+        self.buf.copy_within(sentbytes..len, 0);
+        self.buf.resize(self.buf.len() - sentbytes, 0);
+        if self.buf.is_empty() {
+            // TODO: update buf setting
+            return SendOrQueResult::Complete;
+        } else {
+            return SendOrQueResult::Queue;
+        }
     }
 }
 
@@ -274,7 +470,7 @@ impl MsgReader {
     /// @param msg_size  the decoded message size which is return value of previous call of dispatch. 0 means message having not been decoded.
     /// @return ExpectMsgSize(msgsize) to indicate more read until full msgsize is read then call next dispatch. msgsize==0 means msg size is unknown.
     ///         DropMsgSize(msgsize) to indiciate message is processed already. framework can drop the message after call. then msgsize will be 0 again.
-    /// 
+    ///
     fn try_read(
         &mut self,
         sock: &mut std::net::TcpStream,
@@ -308,7 +504,12 @@ impl MsgReader {
                             sock,
                         ) {
                             DispatchResult::ExpectMsgSize(msgsize) => {
-                                assert!(msgsize == 0 || msgsize > self.bufsize - self.startpos, "{msgsize:?} startpos:{} bufsize: {}", self.startpos, self.bufsize); // either unknown msg size, or partial msg.
+                                assert!(
+                                    msgsize == 0 || msgsize > self.bufsize - self.startpos,
+                                    "{msgsize:?} startpos:{} bufsize: {}",
+                                    self.startpos,
+                                    self.bufsize
+                                ); // either unknown msg size, or partial msg.
                                 self.decoded_msgsize = msgsize; // could be 0 if msg size is unknown.
                             }
                             DispatchResult::DropMsgSize(msgsize) => {
@@ -320,7 +521,7 @@ impl MsgReader {
                     }
                     if self.startpos != 0 {
                         // move front
-                        self.recv_buffer.copy_within(self.startpos..self.bufsize, 0);
+                        self.recv_buffer.copy_within(self.startpos..self.bufsize, 0); // don't resize.
                         self.bufsize -= self.startpos;
                         self.startpos = 0;
                     }
@@ -336,23 +537,19 @@ impl MsgReader {
                     if errkind == ErrorKind::WouldBlock {
                         return true; // wait for next readable.
                     } else if errkind == ErrorKind::ConnectionReset {
-                        logmsg!("sock reset : {sock:?}");
+                        logmsg!("sock reset : {sock:?}. close socket");
                         return false; // socket closed
+                    } else if errkind == ErrorKind::Interrupted {
+                        logmsg!("[WARN] sock Interrupted : {sock:?}. retry");
+                        return true; // Interrupted is not an error.
                     }
-                    logmsg!("ERROR: read on sock {sock:?}, error: {err:?}");
+                    logmsg!("[ERROR]: read on sock {sock:?}, error: {err:?}");
                     return false;
                 }
             }
         }
     }
 }
-//====================================================================================
-//            MsgSender
-//====================================================================================
-
-// pub fn blocking_send(_buf: &mut [u8]) {
-//     //TODO:
-// }
 
 //====================================================================================
 //         Default TcpListenerHandler
@@ -393,7 +590,7 @@ impl<StreamHandler: TcpStreamHandler + Default + 'static> TcpListenerHandler
 //====================================================================================
 
 pub mod sample {
-    use std::io::{Write};
+    use std::io::Write;
 
     use super::*;
 
@@ -427,11 +624,11 @@ pub mod sample {
     }
     impl MsgDispatcher for EchoAndLatency {
         fn dispatch(
-                &mut self,
-                buf: &mut [u8],
-                msg_size: usize,
-                sock: &mut std::net::TcpStream,
-            ) -> DispatchResult {
+            &mut self,
+            buf: &mut [u8],
+            msg_size: usize,
+            sock: &mut std::net::TcpStream,
+        ) -> DispatchResult {
             let mut msg_size = msg_size;
             if msg_size == 0 {
                 // decode header
@@ -443,7 +640,7 @@ pub mod sample {
 
                 if msg_size > buf.len() {
                     return DispatchResult::ExpectMsgSize(msg_size); // decoded msg_size but still partial msg. need reading more.
-                } // else has read full msg.
+                } // else having read full msg. should NOT return. continue processing.
             }
             debug_assert!(buf.len() >= msg_size); // full msg.
                                                   //---- process full message.
@@ -456,7 +653,14 @@ pub mod sample {
                     self.round_trip_durations
                         .push(recvtime - self.last_sent_time);
                     self.single_trip_durations.push(recvtime - header.send_time);
-                    dbglog!("[{}, {}, {}] content: {} <{}>", self.last_sent_time, header.send_time, recvtime, buf.len(), std::str::from_utf8(&buf[MSG_HEADER_SIZE..]).unwrap());
+                    dbglog!(
+                        "[{}, {}, {}] content: {} <{}>",
+                        self.last_sent_time,
+                        header.send_time,
+                        recvtime,
+                        buf.len(),
+                        std::str::from_utf8(&buf[MSG_HEADER_SIZE..]).unwrap()
+                    );
                 }
             }
             // here drop header because report_latencies is one more but borrow.
@@ -547,7 +751,8 @@ pub mod sample {
                 let msg_content = b"test msg00";
                 let mut buf = vec![0u8; msg_content.len() + MSG_HEADER_SIZE];
 
-                buf[MSG_HEADER_SIZE..(MSG_HEADER_SIZE + msg_content.len())].copy_from_slice(&msg_content[..]);
+                buf[MSG_HEADER_SIZE..(MSG_HEADER_SIZE + msg_content.len())]
+                    .copy_from_slice(&msg_content[..]);
                 let header: &mut MsgHeader = utils::bytes_to_ref_mut(&mut buf[0..10]);
                 header.body_len = msg_content.len() as u16;
                 header.send_time = utils::now_nanos();
@@ -565,10 +770,7 @@ pub mod sample {
         }
 
         fn on_readable(&mut self, sock: &mut std::net::TcpStream) -> bool {
-            if !self.reader.try_read(
-                sock,
-                &mut self.dispatcher,
-            ) {
+            if !self.reader.try_read(sock, &mut self.dispatcher) {
                 return false; // error: close
             }
             if self.dispatcher.count_echo >= self.dispatcher.max_echo {
@@ -603,5 +805,9 @@ mod test {
             mgr.process_events();
         }
         assert_eq!(mgr.len(), 1); // remaining listener
+    }
+    #[test]
+    pub fn test_send_or_que() {
+        let _sender = MsgSender::new();
     }
 }

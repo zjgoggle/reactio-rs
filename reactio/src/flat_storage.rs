@@ -4,7 +4,7 @@
 pub struct FlatStorage<T> {
     data: Vec<AllocNode<T>>,
     count: usize,
-    free: usize,
+    free: usize, // free list head
 }
 
 const INVALID_ID: usize = usize::MAX;
@@ -49,16 +49,21 @@ impl<T> FlatStorage<T> {
         }
     }
 
-    pub fn remove(&mut self, key: usize) -> bool {
+    pub fn remove(&mut self, key: usize) -> Option<T> {
         if key < self.data.len() {
-            if let AllocNode::<T>::Occupied(_) = self.data[key] {
-                self.data[key] = AllocNode::<T>::Vacant(self.free);
-                self.free = key;
-                self.count -= 1;
-                return true;
+            if let AllocNode::<T>::Vacant(_) = self.data[key] {
+                return None;
+            } else {
+                if let AllocNode::<T>::Occupied(val) =
+                    std::mem::replace(&mut self.data[key], AllocNode::<T>::Vacant(self.free))
+                {
+                    self.free = key;
+                    self.count -= 1;
+                    return Some(val);
+                }
             }
         }
-        return false;
+        return None;
     }
 
     pub fn get(&self, key: usize) -> Option<&T> {
@@ -77,16 +82,6 @@ impl<T> FlatStorage<T> {
         }
         return None;
     }
-    // pub fn take(&mut self, key: usize) -> Option<T> {
-    //     if key < self.data.len() {
-    //         if let AllocNode::<T>::Occupied(val) = self.data[key] { // need T: Copy ???
-    //             self.data[key] = AllocNode::<T>::Vacant(self.free);
-    //             self.free = key;
-    //             return Some(val);
-    //         }
-    //     }
-    //     return None;
-    // }
 }
 
 #[cfg(test)]
