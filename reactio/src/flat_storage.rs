@@ -22,11 +22,15 @@ impl<T> FlatStorage<T> {
             free: INVALID_ID,
         }
     }
+    /// retrun the number of saved elements.
     pub fn len(&self) -> usize {
         self.count
     }
     pub fn count_free(&self) -> usize {
         self.data.len() - self.count
+    }
+    pub fn capacity(&self) -> usize {
+        self.data.len()
     }
     /// return the key assigned to new added element.
     pub fn add(&mut self, val: T) -> usize {

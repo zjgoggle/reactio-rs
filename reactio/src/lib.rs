@@ -1,3 +1,4 @@
 pub mod flat_storage;
-pub mod poller;
+mod poller;
+pub use poller::*;
 pub mod utils;

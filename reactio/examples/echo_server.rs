@@ -1,19 +1,20 @@
-use reactio::poller::{sample, DefaultTcpListenerHandler, SocketPoller};
+use reactio::{sample, DefaultTcpListenerHandler, ReactRuntime};
 
 fn run(port: i32) {
     let addr = "127.0.0.1:".to_owned() + &port.to_string();
-    let mut mgr = SocketPoller::new();
-    mgr.start_listen(
-        &addr,
-        DefaultTcpListenerHandler::<sample::TcpEchoHandler>::new_boxed(),
-    )
-    .unwrap();
+    let mut runtime = ReactRuntime::new();
+    runtime
+        .start_listen(
+            &addr,
+            DefaultTcpListenerHandler::<sample::MyReactor>::new_boxed(),
+        )
+        .unwrap();
     println!("Started server. Ctl+C to exit.");
-    while mgr.count_streams() == 0 {
-        mgr.process_events();
+    while runtime.count_streams() == 0 {
+        runtime.process_events();
     }
     loop {
-        mgr.process_events(); // for ever
+        runtime.process_events(); // for ever
     }
     // remaining active listener
 }

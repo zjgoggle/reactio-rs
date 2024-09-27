@@ -1,18 +1,19 @@
-use reactio::poller::{sample, SocketPoller};
+use reactio::{sample, ReactRuntime};
 
 fn run(port: i32, max_echos: i32, latency_batch: i32) {
     let addr = "127.0.0.1:".to_owned() + &port.to_string();
-    let mut mgr = SocketPoller::new();
-    mgr.start_connect(
-        &addr,
-        sample::TcpEchoHandler::new_client(max_echos, latency_batch),
-    )
-    .unwrap();
+    let mut runtime = ReactRuntime::new();
+    runtime
+        .start_connect(
+            &addr,
+            sample::MyReactor::new_client(max_echos, latency_batch),
+        )
+        .unwrap();
 
-    while mgr.count_streams() > 0 {
-        mgr.process_events();
+    while runtime.count_streams() > 0 {
+        runtime.process_events();
     }
-    assert_eq!(mgr.len(), 0);
+    assert_eq!(runtime.len(), 0);
 }
 fn main() {
     let port = 10254;
