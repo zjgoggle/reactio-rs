@@ -97,7 +97,10 @@ impl ReactorMgr {
                     .add_with_mode(&sockdata.sock, Event::readable(key), PollMode::Level)
                     .unwrap();
             }
-            logmsg!("Added TcpStream socketKey: {key:?}, sock: {:?}", sockdata.sock);
+            logmsg!(
+                "Added TcpStream socketKey: {key:?}, sock: {:?}",
+                sockdata.sock
+            );
             return (sockdata, handler);
         }
         panic!("ERROR! Failed to get new added sockdata!");
@@ -266,7 +269,9 @@ impl ReactRuntime {
                             }
                             ctx.interested_writable = true; // in case unsolicited event.
                             if ctx.sender.pending.len() > 0 {
-                                if SendOrQueResult::CloseOrError == ctx.sender.send_queued(&mut ctx.sock) {
+                                if SendOrQueResult::CloseOrError
+                                    == ctx.sender.send_queued(&mut ctx.sock)
+                                {
                                     removesock = true;
                                 }
                             }
@@ -289,9 +294,7 @@ impl ReactRuntime {
                                     )
                                     .unwrap();
                                 ctx.interested_writable = true;
-                            } else if ctx.interested_writable
-                                && ctx.sender.pending.len() == 0
-                            {
+                            } else if ctx.interested_writable && ctx.sender.pending.len() == 0 {
                                 self.mgr
                                     .poller
                                     .modify_with_mode(
@@ -309,7 +312,7 @@ impl ReactRuntime {
                 dbglog!("socket key has been removed {}!", ev.key);
             }
             self.mgr.current_polling_sock = INVALID_SOCKET_KEY; // reset
-            
+
             if removesock {
                 self.mgr.close_by_key(SocketKey(ev.key));
                 continue; // ignore error events.
@@ -347,7 +350,6 @@ pub struct MsgSender {
     close_or_error: bool,
 }
 
-
 pub struct PendingSend {
     next_id: usize,  // the id in flat_storage
     startpos: usize, // the first byte of message to sent in buf,
@@ -357,8 +359,8 @@ pub struct PendingSend {
 
 #[derive(PartialEq, Eq)]
 pub enum SendOrQueResult {
-    Complete,             // No message in queue
-    InQueue,              // message in queue
+    Complete,     // No message in queue
+    InQueue,      // message in queue
     CloseOrError, // close socket.
 }
 impl MsgSender {
@@ -781,11 +783,12 @@ pub mod sample {
             header.send_time = utils::now_nanos(); // update send_time only
 
             if self.count_echo < self.max_echo {
-                if SendOrQueResult::CloseOrError == ctx.sender.send_or_que(ctx.sock, &buf[..msg_size], ||{}) {
-
+                self.last_sent_time = utils::now_nanos();
+                if SendOrQueResult::CloseOrError
+                    == ctx.sender.send_or_que(ctx.sock, &buf[..msg_size], || {})
+                {
                     return DispatchResult::Error;
                 }
-                self.last_sent_time = utils::now_nanos();
 
                 self.count_echo += 1;
             }
@@ -869,7 +872,11 @@ pub mod sample {
                 header.send_time = utils::now_nanos();
 
                 //
-                let res = ctx.sender.send_or_que(&mut ctx.sock, &buf[..(msg_content.len() + MSG_HEADER_SIZE)], ||{});
+                let res = ctx.sender.send_or_que(
+                    &mut ctx.sock,
+                    &buf[..(msg_content.len() + MSG_HEADER_SIZE)],
+                    || {},
+                );
                 if res == SendOrQueResult::CloseOrError {
                     return false;
                 }
@@ -911,12 +918,14 @@ mod test {
     pub fn test_tcp_event_handler() {
         let addr = "127.0.0.1:12355";
         let mut runtime = ReactRuntime::new();
-        runtime.start_listen(
-            addr,
-            DefaultTcpListenerHandler::<sample::MyReactor>::new_boxed(),
-        )
-        .unwrap();
-    runtime.start_connect(addr, sample::MyReactor::new_client(2, 1000))
+        runtime
+            .start_listen(
+                addr,
+                DefaultTcpListenerHandler::<sample::MyReactor>::new_boxed(),
+            )
+            .unwrap();
+        runtime
+            .start_connect(addr, sample::MyReactor::new_client(2, 1000))
             .unwrap();
         while runtime.count_streams() > 0 {
             runtime.process_events();
