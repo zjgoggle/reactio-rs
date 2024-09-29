@@ -756,7 +756,7 @@ pub mod sample {
             }
             debug_assert!(buf.len() >= msg_size); // full msg.
                                                   //---- process full message.
-            let recvtime = utils::now_nanos();
+            let recvtime = utils::cpu_now_nanos();
             {
                 let header: &MsgHeader = utils::bytes_to_ref(&buf[0..MSG_HEADER_SIZE]);
                 debug_assert_eq!(header.body_len as usize + MSG_HEADER_SIZE, buf.len());
@@ -780,10 +780,10 @@ pub mod sample {
                 self.report_latencies();
             }
             let header: &mut MsgHeader = utils::bytes_to_ref_mut(&mut buf[0..MSG_HEADER_SIZE]);
-            header.send_time = utils::now_nanos(); // update send_time only
+            header.send_time = utils::cpu_now_nanos(); // update send_time only
 
             if self.count_echo < self.max_echo {
-                self.last_sent_time = utils::now_nanos();
+                self.last_sent_time = utils::cpu_now_nanos();
                 if SendOrQueResult::CloseOrError
                     == ctx.sender.send_or_que(ctx.sock, &buf[..msg_size], || {})
                 {
@@ -797,31 +797,32 @@ pub mod sample {
     }
     impl EchoAndLatency {
         fn report_latencies(&mut self) {
-            println!(
-                "Latencies(us) size: {} min      50%       99%     max",
-                self.round_trip_durations.len()
-            );
-            self.round_trip_durations.sort();
-            self.single_trip_durations.sort();
-            let (d, n) = (
-                &self.single_trip_durations[..],
-                self.single_trip_durations.len(),
-            );
             let fact = 1000;
-            println!(
-                "SingleTrip        {}       {}      {}      {}",
-                d[0] / fact,
-                d[n / 2] / fact,
-                d[(n as f32 * 0.99) as usize] / fact,
-                d[n - 2] / fact
-            );
+            // println!(
+            //     "RoundTrip Latencies(us) size: {} min      50%       99%     max",
+            //     self.round_trip_durations.len()
+            // );
+            self.round_trip_durations.sort();
+            // self.single_trip_durations.sort();
+            // let (d, n) = (
+            //     &self.single_trip_durations[..],
+            //     self.single_trip_durations.len(),
+            // );
+            // println!(
+            //     "SingleTrip        {}       {}      {}      {}",
+            //     d[0] / fact,
+            //     d[n / 2] / fact,
+            //     d[(n as f32 * 0.99) as usize] / fact,
+            //     d[n - 2] / fact
+            // );
 
             let (d, n) = (
                 &self.round_trip_durations[..],
                 self.round_trip_durations.len(),
             );
             println!(
-                "RoundTrip         {}       {}      {}      {}",
+                "RoundTrip time(us) size: {}  min: {}   median: {}    99%: {}   max: {}",
+                self.round_trip_durations.len(),
                 d[0] / fact,
                 d[n / 2] / fact,
                 d[(n as f32 * 0.99) as usize] / fact,
@@ -869,7 +870,7 @@ pub mod sample {
                     .copy_from_slice(&msg_content[..]);
                 let header: &mut MsgHeader = utils::bytes_to_ref_mut(&mut buf[0..10]);
                 header.body_len = msg_content.len() as u16;
-                header.send_time = utils::now_nanos();
+                header.send_time = utils::cpu_now_nanos();
 
                 //
                 let res = ctx.sender.send_or_que(
