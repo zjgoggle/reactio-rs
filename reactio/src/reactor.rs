@@ -5,7 +5,6 @@ use crate::logmsg;
 use crate::utils;
 use core::panic;
 use polling::{Event, Events, PollMode, Poller};
-// TODO : investigate whether polling has implemented Poller with IOCP correctly ???
 use std::io::{ErrorKind, Read, Write};
 use std::time::Duration;
 use std::{marker::PhantomData, net::TcpStream};
@@ -15,11 +14,19 @@ use std::{marker::PhantomData, net::TcpStream};
 //====================================================================================
 
 pub trait Reactor {
-    fn on_connected(&mut self, ctx: &mut Context) -> bool;
+    fn on_connected(&mut self, ctx: &mut ReactorContext) -> bool;
     /// \return false to close socket.
-    fn on_readable(&mut self, ctx: &mut Context) -> bool;
+    fn on_readable(&mut self, ctx: &mut ReactorContext) -> bool;
 }
 
+pub type CmdSender = std::sync::mpsc::Sender<CmdData>;
+pub struct ReactorContext<'a> {
+    pub sockkey: SocketKey,
+    pub sock: &'a mut std::net::TcpStream,
+    pub sender: &'a mut MsgSender, // sock_sender
+    pub reader: &'a mut MsgReader, // sock_reader
+    pub cmd_sender: &'a CmdSender,
+}
 pub trait TcpListenerHandler {
     /// \return null to close new connection.
     fn on_new_connection(
@@ -42,30 +49,49 @@ struct ReactorMgr {
     poller: Poller,
     count_streams: usize,            // TcpStreams only (excluding TcpListener)
     current_polling_sock: SocketKey, // the socket that is being processed in process_event function.
+    cmd_recv: std::sync::mpsc::Receiver<CmdData>,
+    cmd_sender: CmdSender,
 }
 
 enum TcpSocketHandler {
     ListenerType(std::net::TcpListener, Box<dyn TcpListenerHandler>), // <sock, handler, key_in_flat_storage>
-    StreamType(Context, Box<dyn Reactor>),
+    StreamType(SockData, Box<dyn Reactor>),
 }
-pub struct Context {
+pub struct SockData {
     pub sockkey: SocketKey,
     pub sock: std::net::TcpStream,
     pub sender: MsgSender,
     pub reader: MsgReader,
     interested_writable: bool,
 }
+impl<'a> ReactorContext<'a> {
+    fn from(data: &'a mut SockData, cmd_sender: &'a CmdSender) -> Self {
+        Self {
+            sockkey: data.sockkey,
+            sock: &mut data.sock,
+            sender: &mut data.sender,
+            reader: &mut data.reader,
+            cmd_sender: cmd_sender,
+        }
+    }
+}
+
 #[derive(Copy, Clone, PartialEq, Eq)]
 pub struct SocketKey(usize); // identify a socket in ReactorMgr.
 pub const INVALID_SOCKET_KEY: SocketKey = SocketKey(usize::MAX);
+pub type ReactorID = SocketKey;
+pub const INVALID_REACTOR_ID: ReactorID = INVALID_SOCKET_KEY;
 
 impl ReactorMgr {
     pub fn new() -> Self {
+        let (cmd_sender, cmd_recv) = std::sync::mpsc::channel::<CmdData>();
         Self {
             socket_handlers: FlatStorage::new(),
             poller: Poller::new().unwrap(),
             count_streams: 0,
             current_polling_sock: INVALID_SOCKET_KEY,
+            cmd_sender: cmd_sender,
+            cmd_recv: cmd_recv,
         }
     }
     /// \return number of all managed socks.
@@ -76,9 +102,9 @@ impl ReactorMgr {
         &'a mut self,
         sock: std::net::TcpStream,
         handler: Box<dyn Reactor>,
-    ) -> (&'a mut Context, &'a mut Box<dyn Reactor>) {
+    ) -> SocketKey {
         let key = self.socket_handlers.add(TcpSocketHandler::StreamType(
-            Context {
+            SockData {
                 sockkey: INVALID_SOCKET_KEY,
                 sock: sock,
                 sender: MsgSender::new(),
@@ -101,7 +127,7 @@ impl ReactorMgr {
                 "Added TcpStream socketKey: {key:?}, sock: {:?}",
                 sockdata.sock
             );
-            return (sockdata, handler);
+            return SocketKey(key);
         }
         panic!("ERROR! Failed to get new added sockdata!");
     }
@@ -171,11 +197,15 @@ impl ReactorMgr {
         let sockkey = {
             let socket = TcpStream::connect(remote_addr)?;
             socket.set_nonblocking(true)?; // FIXME: use blocking socket and each nonblocking read and blocking write.
-            let (sockdata, handler) = self.add_stream(socket, handler);
-            if handler.on_connected(sockdata) {
-                return Result::Ok(sockdata.sockkey);
+            let sockkey = self.add_stream(socket, handler);
+            if let TcpSocketHandler::StreamType(ref mut sockdata, ref mut handler) =
+                self.socket_handlers.get_mut(sockkey.0).unwrap()
+            {
+                if handler.on_connected(&mut ReactorContext::from(sockdata, &self.cmd_sender)) {
+                    return Result::Ok(sockdata.sockkey);
+                }
             }
-            sockdata.sockkey
+            sockkey
         };
         self.close_by_key(sockkey);
         Result::Ok(INVALID_SOCKET_KEY)
@@ -201,6 +231,9 @@ impl ReactRuntime {
     pub fn count_streams(&self) -> usize {
         self.mgr.count_streams
     }
+    pub fn get_cmd_sender(&self) -> &CmdSender {
+        &self.mgr.cmd_sender
+    }
 
     /// Start to listen on port. When call handler on new connection;
     /// The handler will create new stream socket handler for TCP stream.
@@ -223,7 +256,7 @@ impl ReactRuntime {
     }
 
     /// return true to indicate some events has been processed.
-    pub fn process_events(&mut self) -> bool {
+    fn process_sock_events(&mut self) -> bool {
         self.events.clear();
         self.mgr
             .poller
@@ -243,12 +276,22 @@ impl ReactRuntime {
                             {
                                 newsock.set_nonblocking(true).unwrap();
                                 let newsockkey_to_close = {
-                                    let (newsockdata, newhandler) =
-                                        self.mgr.add_stream(newsock, newhandler);
-                                    if !newhandler.on_connected(newsockdata) {
-                                        newsockdata.sockkey
+                                    let newsockkey = self.mgr.add_stream(newsock, newhandler);
+                                    if let TcpSocketHandler::StreamType(
+                                        ref mut newsockdata,
+                                        ref mut newhandler,
+                                    ) = self.mgr.socket_handlers.get_mut(newsockkey.0).unwrap()
+                                    {
+                                        if !newhandler.on_connected(&mut ReactorContext::from(
+                                            newsockdata,
+                                            &self.mgr.cmd_sender,
+                                        )) {
+                                            newsockdata.sockkey
+                                        } else {
+                                            INVALID_SOCKET_KEY
+                                        }
                                     } else {
-                                        INVALID_SOCKET_KEY
+                                        panic!("Failed to find new added stream!");
                                     }
                                 };
                                 if newsockkey_to_close != INVALID_SOCKET_KEY {
@@ -277,7 +320,8 @@ impl ReactRuntime {
                             }
                         }
                         if ev.readable {
-                            removesock = !handler.on_readable(ctx);
+                            removesock = !handler
+                                .on_readable(&mut ReactorContext::from(ctx, &self.mgr.cmd_sender));
                         }
                         if ctx.sender.close_or_error {
                             removesock = true;
@@ -331,6 +375,86 @@ impl ReactRuntime {
         }
 
         return !self.events.is_empty();
+    }
+
+    fn process_commands(&mut self) -> bool {
+        // TODO
+        false
+    }
+    pub fn process_events(&mut self) -> bool {
+        let has_events = self.process_sock_events();
+        let has_cmds = self.process_commands();
+        return has_events || has_cmds;
+    }
+}
+
+//====================================================================================
+//            Command to Reactor
+//====================================================================================
+
+pub enum Command {
+    //-- system commands are processed by Runtime, Reactor will not receive them.
+    NewConnect(String, u32, Box<dyn Reactor>), // connect to remote IP:Port
+    NewListen(String, u32, Box<dyn TcpListenerHandler>), // listen on IP:Port
+    CloseSocket,
+    //-- below command are passed to reactor
+    UserStr(String),
+    UserInt(i64),
+    UserFn(Box<dyn Fn()>),
+}
+
+pub enum Deferred {
+    Immediate,
+    ForTime(std::time::Duration),
+    UtilTime(std::time::SystemTime),
+}
+pub enum CommandCompletion {
+    Completed(SocketKey),
+    Error(String),
+}
+
+pub struct CmdData {
+    reactorid: ReactorID,
+    cmd: Command,
+    deferred: Deferred,
+    completion: Box<dyn FnOnce(CommandCompletion)>,
+}
+unsafe impl Send for CmdData {}
+
+trait ReactorCmdSender {
+    fn send_cmd(
+        &self,
+        reactorid: ReactorID,
+        cmd: Command,
+        deferred: Deferred,
+        completion: impl FnOnce(CommandCompletion) + 'static,
+    );
+}
+
+impl ReactorCmdSender for CmdSender {
+    fn send_cmd(
+        &self,
+        reactorid: ReactorID,
+        cmd: Command,
+        deferred: Deferred,
+        completion: impl FnOnce(CommandCompletion) + 'static,
+    ) {
+        // check NewConnect/NewListen when reactor == INVALID.
+        match &cmd {
+            Command::NewListen(_, _, _) | Command::NewConnect(_, _, _) => {
+                if reactorid != INVALID_REACTOR_ID {
+                    panic!("reactorid msut be INVALID_REACTOR_ID if NewConnect/NewListen");
+                }
+            }
+            _ => {}
+        }
+        self.send(CmdData {
+            reactorid: reactorid,
+            cmd: cmd,
+            deferred: deferred,
+            completion: Box::new(completion),
+        })
+        .unwrap();
     }
 }
 
@@ -546,7 +670,8 @@ pub trait MsgDispatcher {
 
 pub struct DispatchContext<'a> {
     pub sock: &'a mut std::net::TcpStream,
-    pub sender: &'a mut MsgSender,
+    pub sender: &'a mut MsgSender, // socker sender
+    pub cmd_sender: &'a CmdSender,
 }
 
 pub enum DispatchResult {
@@ -860,7 +985,7 @@ pub mod sample {
     }
 
     impl Reactor for MyReactor {
-        fn on_connected(&mut self, ctx: &mut Context) -> bool {
+        fn on_connected(&mut self, ctx: &mut ReactorContext) -> bool {
             if self.dispatcher.is_client {
                 logmsg!("client sock: {:?} connected.", ctx.sock);
                 let msg_content = b"test msg00";
@@ -888,11 +1013,12 @@ pub mod sample {
             return true;
         }
 
-        fn on_readable(&mut self, ctx: &mut Context) -> bool {
+        fn on_readable(&mut self, ctx: &mut ReactorContext) -> bool {
             if !ctx.reader.try_read(
                 &mut DispatchContext {
                     sock: &mut ctx.sock,
                     sender: &mut ctx.sender,
+                    cmd_sender: &ctx.cmd_sender,
                 },
                 &mut self.dispatcher,
             ) {

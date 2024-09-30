@@ -100,11 +100,8 @@ pub fn now_nanos() -> i64 {
 
 // Useful when windows timespec_get has only low resolution.
 pub fn cpu_now_nanos() -> i64 {
-    let epoch: std::time::Instant =
-        unsafe { std::mem::MaybeUninit::zeroed().assume_init() };
-    return std::time::Instant::now()
-        .duration_since(epoch)
-        .as_nanos() as i64;
+    let epoch: std::time::Instant = unsafe { std::mem::MaybeUninit::zeroed().assume_init() };
+    return std::time::Instant::now().duration_since(epoch).as_nanos() as i64;
 }
 
 #[macro_export]
