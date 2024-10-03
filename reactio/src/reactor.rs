@@ -9,6 +9,8 @@ use std::io::{ErrorKind, Read, Write};
 use std::time::Duration;
 use std::{marker::PhantomData, net::TcpStream};
 
+// Reference for iocp based epoll: https://accserv.lepp.cornell.edu/svn/packages/libzmq/external/wepoll/wepoll.c
+
 //====================================================================================
 //            Poller
 //====================================================================================
@@ -783,6 +785,9 @@ impl MsgReader {
                     } else if errkind == ErrorKind::Interrupted {
                         logmsg!("[WARN] sock Interrupted : {:?}. retry", ctx.sock);
                         return true; // Interrupted is not an error.
+                    } else if errkind == ErrorKind::ConnectionAborted { 
+                        logmsg!("sock ConnectionAborted : {:?}. close socket", ctx.sock); // closed by remote (windows)
+                        return false; // close socket.
                     }
                     logmsg!("[ERROR]: read on sock {:?}, error: {err:?}", ctx.sock);
                     return false;
@@ -891,7 +896,8 @@ pub mod sample {
                         .push(recvtime - self.last_sent_time);
                     self.single_trip_durations.push(recvtime - header.send_time);
                     dbglog!(
-                        "Recv msg [{}, {}, {}] content: {} <{}>",
+                        "Recv msg sock: {:?} [{}, {}, {}] content: {} <{}>",
+                        ctx.sock,
                         self.last_sent_time,
                         header.send_time,
                         recvtime,
