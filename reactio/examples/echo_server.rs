@@ -9,17 +9,10 @@ fn run(port: i32) {
             DefaultTcpListenerHandler::<sample::MyReactor>::new_boxed(),
         )
         .unwrap();
-    println!("Started server. Ctl+C to exit.");
-    while runtime.count_streams() == 0 {
-        runtime.process_events();
-    }
-    loop {
-        runtime.process_events(); // for ever
-    }
-    // remaining active listener
+    while runtime.process_events() {}
 }
 fn main() {
     let port = 10254;
     run(port);
-    println!("Hello from an echo_server!");
+    println!("End of echo_server!");
 }

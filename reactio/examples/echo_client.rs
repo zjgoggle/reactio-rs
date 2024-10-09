@@ -10,9 +10,7 @@ fn run(port: i32, max_echos: i32, latency_batch: i32) {
         )
         .unwrap();
 
-    while runtime.count_streams() > 0 {
-        runtime.process_events();
-    }
+    while runtime.process_events() {}
     assert_eq!(runtime.len(), 0);
 }
 fn main() {

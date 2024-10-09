@@ -9,16 +9,21 @@ use std::io::{ErrorKind, Read, Write};
 use std::time::Duration;
 use std::{marker::PhantomData, net::TcpStream};
 
-// Reference for iocp based epoll: https://accserv.lepp.cornell.edu/svn/packages/libzmq/external/wepoll/wepoll.c
-
 //====================================================================================
-//            Poller
+//            Reactor, Poller
 //====================================================================================
 
 pub trait Reactor {
-    fn on_connected(&mut self, ctx: &mut ReactorContext) -> bool;
+    /// called when connection is established.
+    /// @param listener the listener ID when the reactor is created by a listener socket; otherwise, it's INVALID_REACTOR_ID.
+    fn on_connected(&mut self, ctx: &mut ReactorContext, listener: ReactorID) -> bool;
+
     /// \return false to close socket.
     fn on_readable(&mut self, ctx: &mut ReactorContext) -> bool;
+
+    /// called when the reactor is removed from poller and before closing the socket.
+    /// The Reactor will be destroyed after this call.
+    fn on_close(&mut self, _cmd_sender: &CmdSender) {}
 }
 
 pub type CmdSender = std::sync::mpsc::Sender<CmdData>;
@@ -37,6 +42,8 @@ pub trait TcpListenerHandler {
         new_sock: &mut std::net::TcpStream,
         addr: std::net::SocketAddr,
     ) -> Option<Box<dyn Reactor>>;
+
+    fn on_close(&mut self, _cmd_sender: &CmdSender) {}
 }
 
 /// ReactRuntime manages TCP connections & polling.
@@ -116,7 +123,7 @@ impl ReactorMgr {
             handler,
         ));
         self.count_streams += 1;
-        if let TcpSocketHandler::StreamType(ref mut sockdata, ref mut handler) =
+        if let TcpSocketHandler::StreamType(ref mut sockdata, ref mut _handler) =
             self.socket_handlers.get_mut(key).unwrap()
         {
             sockdata.sockkey = SocketKey(key);
@@ -155,13 +162,15 @@ impl ReactorMgr {
         SocketKey(key)
     }
 
-    pub fn close_by_key(&mut self, key: SocketKey) {
+    /// Close & remove socket/reactor.
+    /// @return true if key exists ; false when key doesn't exist or it's in process of polling.
+    pub fn close_by_key(&mut self, key: SocketKey) -> bool {
         if self.current_polling_sock == key {
-            return; // it's being processed in process_event.
+            return false; // it's being processed in process_event.
         }
         if let Some(sockhandler) = self.socket_handlers.remove(key.0) {
             match sockhandler {
-                TcpSocketHandler::StreamType(sockdata, _) => {
+                TcpSocketHandler::StreamType(sockdata, mut reactor) => {
                     logmsg!(
                         "removing key: {}, sock: {:?}, pending_send_bytes: {}",
                         key.0,
@@ -169,15 +178,18 @@ impl ReactorMgr {
                         sockdata.sender.buf.len()
                     );
                     self.count_streams -= 1;
-                    self.poller.delete(sockdata.sock).unwrap();
+                    self.poller.delete(&sockdata.sock).unwrap();
+                    (reactor).on_close(&self.cmd_sender);
                 }
-                TcpSocketHandler::ListenerType(sock, _) => {
+                TcpSocketHandler::ListenerType(sock, mut reactor) => {
                     logmsg!("removing key: {}, sock: {:?}", key.0, sock);
-                    self.poller.delete(sock).unwrap();
+                    self.poller.delete(&sock).unwrap();
+                    (reactor).on_close(&self.cmd_sender);
                 }
             }
+            return true;
         }
-        self.socket_handlers.remove(key.0); // sock is auto closed when being dropped.
+        return false;
     }
 
     /// \local_addr  ip:port. e.g. "127.0.0.1:8000"
@@ -203,7 +215,10 @@ impl ReactorMgr {
             if let TcpSocketHandler::StreamType(ref mut sockdata, ref mut handler) =
                 self.socket_handlers.get_mut(sockkey.0).unwrap()
             {
-                if handler.on_connected(&mut ReactorContext::from(sockdata, &self.cmd_sender)) {
+                if handler.on_connected(
+                    &mut ReactorContext::from(sockdata, &self.cmd_sender),
+                    INVALID_REACTOR_ID,
+                ) {
                     return Result::Ok(sockdata.sockkey);
                 }
             }
@@ -235,6 +250,17 @@ impl ReactRuntime {
     }
     pub fn get_cmd_sender(&self) -> &CmdSender {
         &self.mgr.cmd_sender
+    }
+    pub fn send_cmd(
+        &self,
+        reactorid: ReactorID,
+        cmd: Command,
+        deferred: Deferred,
+        completion: impl FnOnce(CommandCompletion) + 'static,
+    ) {
+        self.mgr
+            .cmd_sender
+            .send_cmd(reactorid, cmd, deferred, completion);
     }
 
     /// Start to listen on port. When call handler on new connection;
@@ -284,10 +310,13 @@ impl ReactRuntime {
                                         ref mut newhandler,
                                     ) = self.mgr.socket_handlers.get_mut(newsockkey.0).unwrap()
                                     {
-                                        if !newhandler.on_connected(&mut ReactorContext::from(
-                                            newsockdata,
-                                            &self.mgr.cmd_sender,
-                                        )) {
+                                        if !newhandler.on_connected(
+                                            &mut ReactorContext::from(
+                                                newsockdata,
+                                                &self.mgr.cmd_sender,
+                                            ),
+                                            SocketKey(ev.key),
+                                        ) {
                                             newsockdata.sockkey
                                         } else {
                                             INVALID_SOCKET_KEY
@@ -379,14 +408,78 @@ impl ReactRuntime {
         return !self.events.is_empty();
     }
 
-    fn process_commands(&mut self) -> bool {
-        // TODO
-        false
+    /// @return number of command procesed
+    fn process_commands(&mut self) -> usize {
+        let mut count_cmd = 0usize;
+        loop {
+            let cmddata: CmdData = match self.mgr.cmd_recv.try_recv() {
+                Err(err) => {
+                    if err == std::sync::mpsc::TryRecvError::Empty {
+                        return count_cmd;
+                    } else {
+                        panic!("std::sync::mpsc::TryRecvError::Disconnected is not possible. Because both cmd_sender & cmd_recv are saved.");
+                    }
+                }
+                Ok(data) => data,
+            };
+            count_cmd += 1;
+
+            match cmddata.deferred {
+                Deferred::Immediate => {}
+                _ => {
+                    panic!("TODO: support deferred command");
+                    // TODO: save to defered cmd queue.
+                }
+            }
+
+            match cmddata.cmd {
+                Command::NewConnect(remote_addr, reactor) => {
+                    match self.mgr.start_connect(&remote_addr, reactor) {
+                        Err(err) => {
+                            let errmsg =
+                                format!("Failed to connect to {}. Error: {}", remote_addr, err);
+                            (cmddata.completion)(CommandCompletion::Error(errmsg));
+                        }
+                        Ok(key) => {
+                            (cmddata.completion)(CommandCompletion::Completed(key));
+                        }
+                    }
+                }
+                Command::NewListen(local_addr, reactor) => {
+                    match self.mgr.start_listen(&local_addr, reactor) {
+                        Err(err) => {
+                            let errmsg =
+                                format!("Failed to listen on {}. Error: {}", local_addr, err);
+                            (cmddata.completion)(CommandCompletion::Error(errmsg));
+                        }
+                        Ok(key) => {
+                            (cmddata.completion)(CommandCompletion::Completed(key));
+                        }
+                    }
+                }
+                Command::CloseSocket => {
+                    if self.mgr.close_by_key(cmddata.reactorid) {
+                        (cmddata.completion)(CommandCompletion::Completed(cmddata.reactorid));
+                    } else {
+                        (cmddata.completion)(CommandCompletion::Error(format!(
+                            "Failed to remove non exist socket with key: {}",
+                            cmddata.reactorid.0
+                        )));
+                    }
+                }
+                _ => {
+                    panic!("TODO: support other command types!");
+                }
+            } // match cmd
+        } // loop
     }
+
+    /// This function should be periodically called to process socket messages and commands.
+    /// @return true if the runtime has reactor or command; false when there's no reactor/socket or command, then this runtime could be destroyed.
     pub fn process_events(&mut self) -> bool {
         let has_events = self.process_sock_events();
-        let has_cmds = self.process_commands();
-        return has_events || has_cmds;
+        let cmds = self.process_commands();
+        return has_events || cmds > 0 || self.len() > 0; // TODO or there are defered commands.
     }
 }
 
@@ -396,13 +489,13 @@ impl ReactRuntime {
 
 pub enum Command {
     //-- system commands are processed by Runtime, Reactor will not receive them.
-    NewConnect(String, u32, Box<dyn Reactor>), // connect to remote IP:Port
-    NewListen(String, u32, Box<dyn TcpListenerHandler>), // listen on IP:Port
+    NewConnect(String, Box<dyn Reactor>), // connect to remote IP:Port
+    NewListen(String, Box<dyn TcpListenerHandler>), // listen on IP:Port
     CloseSocket,
     //-- below command are passed to reactor
-    UserStr(String),
-    UserInt(i64),
-    UserFn(Box<dyn Fn()>),
+    // UserStr(String),
+    // UserInt(i64),
+    // UserFn(Box<dyn Fn()>),
 }
 
 pub enum Deferred {
@@ -443,7 +536,7 @@ impl ReactorCmdSender for CmdSender {
     ) {
         // check NewConnect/NewListen when reactor == INVALID.
         match &cmd {
-            Command::NewListen(_, _, _) | Command::NewConnect(_, _, _) => {
+            Command::NewListen(_, _) | Command::NewConnect(_, _) => {
                 if reactorid != INVALID_REACTOR_ID {
                     panic!("reactorid msut be INVALID_REACTOR_ID if NewConnect/NewListen");
                 }
@@ -785,7 +878,7 @@ impl MsgReader {
                     } else if errkind == ErrorKind::Interrupted {
                         logmsg!("[WARN] sock Interrupted : {:?}. retry", ctx.sock);
                         return true; // Interrupted is not an error.
-                    } else if errkind == ErrorKind::ConnectionAborted { 
+                    } else if errkind == ErrorKind::ConnectionAborted {
                         logmsg!("sock ConnectionAborted : {:?}. close socket", ctx.sock); // closed by remote (windows)
                         return false; // close socket.
                     }
@@ -855,6 +948,7 @@ pub mod sample {
     /// MsgReader & MsgDispatcher must be decoupled.
     /// See issue: https://stackoverflow.com/questions/79015535/could-anybody-optimize-class-design-and-fix-issue-mutable-more-than-once-at-a-t
     struct EchoAndLatency {
+        pub parent_listener: ReactorID,
         pub is_client: bool, // default false
         pub max_echo: i32,
         pub count_echo: i32,
@@ -973,6 +1067,7 @@ pub mod sample {
         pub fn new(isclient: bool, a_max_echo: i32, a_latency_batch: i32) -> Self {
             Self {
                 dispatcher: EchoAndLatency {
+                    parent_listener: INVALID_REACTOR_ID,
                     is_client: isclient,
                     max_echo: a_max_echo,
                     count_echo: 0,
@@ -991,7 +1086,8 @@ pub mod sample {
     }
 
     impl Reactor for MyReactor {
-        fn on_connected(&mut self, ctx: &mut ReactorContext) -> bool {
+        fn on_connected(&mut self, ctx: &mut ReactorContext, listener: ReactorID) -> bool {
+            self.dispatcher.parent_listener = listener;
             if self.dispatcher.is_client {
                 logmsg!("client sock: {:?} connected.", ctx.sock);
                 let msg_content = b"test msg00";
@@ -1014,6 +1110,14 @@ pub mod sample {
                 }
                 dbglog!("client sent initial msg");
             } else {
+                // if it's not client. close parent listener socket.
+                ctx.cmd_sender.send_cmd(
+                    self.dispatcher.parent_listener,
+                    Command::CloseSocket,
+                    Deferred::Immediate,
+                    |_res| {},
+                );
+
                 logmsg!("server sock: {:?} connected.", ctx.sock);
             }
             return true;
@@ -1048,7 +1152,7 @@ mod test {
     use super::*;
 
     #[test]
-    pub fn test_tcp_event_handler() {
+    pub fn test_ping_pong_reactor() {
         let addr = "127.0.0.1:12355";
         let mut runtime = ReactRuntime::new();
         runtime
@@ -1060,13 +1164,29 @@ mod test {
         runtime
             .start_connect(addr, sample::MyReactor::new_client(2, 1000))
             .unwrap();
-        while runtime.count_streams() > 0 {
-            runtime.process_events();
-        }
-        assert_eq!(runtime.len(), 1); // remaining listener
+        while runtime.process_events() {}
+        assert_eq!(runtime.len(), 0);
     }
     #[test]
-    pub fn test_send_or_que() {
-        let _sender = MsgSender::new();
+    pub fn test_reactors_cmd() {
+        let addr = "127.0.0.1:12355";
+        let mut runtime = ReactRuntime::new();
+        runtime.send_cmd(
+            INVALID_REACTOR_ID,
+            Command::NewListen(
+                addr.to_owned(),
+                DefaultTcpListenerHandler::<sample::MyReactor>::new_boxed(),
+            ),
+            Deferred::Immediate,
+            |_| {},
+        );
+        runtime.send_cmd(
+            INVALID_REACTOR_ID,
+            Command::NewConnect(addr.to_owned(), sample::MyReactor::new_client(2, 1000)),
+            Deferred::Immediate,
+            |_| {},
+        );
+        while runtime.process_events() {}
+        assert_eq!(runtime.len(), 0);
     }
 }
