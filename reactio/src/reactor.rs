@@ -13,43 +13,57 @@ use std::{marker::PhantomData, net::TcpStream};
 //            Reactor, Poller
 //====================================================================================
 
-pub trait Reactor {
+/// A Reactor is assigned a unique ReactorID by ReactRuntime, and is able to receive socket messsages (via reader) and commands.
+/// Besides socket communication, Sending command is the only thread-safe way to communicate with a Reactor.
+/// A Reactor could send socket messages (via sender), and send commands (via cmd_sender) to another Reactor with specific ReactorID.
+pub trait Reactor<UserCommand> {
     /// called when connection is established.
     /// @param listener the listener ID when the reactor is created by a listener socket; otherwise, it's INVALID_REACTOR_ID.
-    fn on_connected(&mut self, ctx: &mut ReactorContext, listener: ReactorID) -> bool;
+    fn on_connected(&mut self, ctx: &mut ReactorContext<UserCommand>, listener: ReactorID) -> bool;
 
     /// \return false to close socket.
-    fn on_readable(&mut self, ctx: &mut ReactorContext) -> bool;
+    fn on_readable(&mut self, ctx: &mut ReactorContext<UserCommand>) -> bool;
+
+    fn on_command(&mut self, cmd: UserCommand, ctx: &mut ReactorContext<UserCommand>);
 
     /// called when the reactor is removed from poller and before closing the socket.
     /// The Reactor will be destroyed after this call.
-    fn on_close(&mut self, _cmd_sender: &CmdSender) {}
+    fn on_close(&mut self, _cmd_sender: &CmdSender<UserCommand>) {}
 }
 
-pub type CmdSender = std::sync::mpsc::Sender<CmdData>;
-pub struct ReactorContext<'a> {
+pub type CmdSender<UserCommand> = std::sync::mpsc::Sender<CmdData<UserCommand>>;
+pub struct ReactorContext<'a, UserCommand> {
     pub sockkey: SocketKey,
     pub sock: &'a mut std::net::TcpStream,
     pub sender: &'a mut MsgSender, // sock_sender
     pub reader: &'a mut MsgReader, // sock_reader
-    pub cmd_sender: &'a CmdSender,
+    pub cmd_sender: &'a CmdSender<UserCommand>,
 }
-pub trait TcpListenerHandler {
+pub trait TcpListenerHandler<UserCommand> {
     /// \return null to close new connection.
     fn on_new_connection(
         &mut self,
         sock: &mut std::net::TcpListener,
         new_sock: &mut std::net::TcpStream,
         addr: std::net::SocketAddr,
-    ) -> Option<Box<dyn Reactor>>;
+    ) -> Option<Box<dyn Reactor<UserCommand>>>;
 
-    fn on_close(&mut self, _cmd_sender: &CmdSender) {}
+    fn on_close(&mut self, _cmd_sender: &CmdSender<UserCommand>) {}
 }
 
-/// ReactRuntime manages TCP connections & polling.
-pub struct ReactRuntime {
-    mgr: ReactorMgr,
-    defered_data: FlatStorage<CmdData>,
+/// ReactRuntime manages Reactors which receive socket data or command.
+/// A ReactRuntime has a command queue, defered command queue and a collection of reactors.
+/// Each reactor is assigned a ReactorID when adding to ReactRuntime. Users send command to a reactor
+/// with a specific ReactorID that belongs to the ReactRuntime. If it's INVALID_REACTOR_ID,
+/// The command will not be passed to a reactor. The command could be immediate or defered for a time.
+/// A example is that, on close of a reactor, it could send a command to the ReactRuntime to reconnect.
+///
+/// Communication between ReactRuntimes are via sending command also, which is the only thread-safe way.
+/// Note that a ReactRuntime can only exist in a thread. Accessing a ReactRuntime from multiple thread is not supported.
+/// Also multiple ReactRuntime in a thread is feasible, but is not needed.
+pub struct ReactRuntime<UserCommand> {
+    mgr: ReactorMgr<UserCommand>,
+    defered_data: FlatStorage<CmdData<UserCommand>>,
     defered_heap: Vec<DeferedKey>, // min heap of (scheduled_time_nanos, Cmd_index_in_defered_data)
     events: Events, // decoupled events and connections to avoid double mutable refererence.
 }
@@ -99,18 +113,21 @@ fn min_heap_pop(v: &mut [DeferedKey]) {
 }
 
 // Make a seperate struct ReactorMgr because when interating TcpConnectionMgr::events, sessions must be mutable in process_events.
-struct ReactorMgr {
-    socket_handlers: FlatStorage<TcpSocketHandler>,
+struct ReactorMgr<UserCommand> {
+    socket_handlers: FlatStorage<TcpSocketHandler<UserCommand>>,
     poller: Poller,
     count_streams: usize,            // TcpStreams only (excluding TcpListener)
     current_polling_sock: SocketKey, // the socket that is being processed in process_event function.
-    cmd_recv: std::sync::mpsc::Receiver<CmdData>,
-    cmd_sender: CmdSender,
+    cmd_recv: std::sync::mpsc::Receiver<CmdData<UserCommand>>,
+    cmd_sender: CmdSender<UserCommand>,
 }
 
-enum TcpSocketHandler {
-    ListenerType(std::net::TcpListener, Box<dyn TcpListenerHandler>), // <sock, handler, key_in_flat_storage>
-    StreamType(SockData, Box<dyn Reactor>),
+enum TcpSocketHandler<UserCommand> {
+    ListenerType(
+        std::net::TcpListener,
+        Box<dyn TcpListenerHandler<UserCommand>>,
+    ), // <sock, handler, key_in_flat_storage>
+    StreamType(SockData, Box<dyn Reactor<UserCommand>>),
 }
 pub struct SockData {
     pub sockkey: SocketKey,
@@ -119,8 +136,8 @@ pub struct SockData {
     pub reader: MsgReader,
     interested_writable: bool,
 }
-impl<'a> ReactorContext<'a> {
-    fn from(data: &'a mut SockData, cmd_sender: &'a CmdSender) -> Self {
+impl<'a, UserCommand> ReactorContext<'a, UserCommand> {
+    fn from(data: &'a mut SockData, cmd_sender: &'a CmdSender<UserCommand>) -> Self {
         Self {
             sockkey: data.sockkey,
             sock: &mut data.sock,
@@ -137,9 +154,9 @@ pub const INVALID_SOCKET_KEY: SocketKey = SocketKey(usize::MAX);
 pub type ReactorID = SocketKey;
 pub const INVALID_REACTOR_ID: ReactorID = INVALID_SOCKET_KEY;
 
-impl ReactorMgr {
+impl<UserCommand> ReactorMgr<UserCommand> {
     pub fn new() -> Self {
-        let (cmd_sender, cmd_recv) = std::sync::mpsc::channel::<CmdData>();
+        let (cmd_sender, cmd_recv) = std::sync::mpsc::channel::<CmdData<UserCommand>>();
         Self {
             socket_handlers: FlatStorage::new(),
             poller: Poller::new().unwrap(),
@@ -156,7 +173,7 @@ impl ReactorMgr {
     pub fn add_stream<'a>(
         &'a mut self,
         sock: std::net::TcpStream,
-        handler: Box<dyn Reactor>,
+        handler: Box<dyn Reactor<UserCommand>>,
     ) -> SocketKey {
         let key = self.socket_handlers.add(TcpSocketHandler::StreamType(
             SockData {
@@ -190,7 +207,7 @@ impl ReactorMgr {
     pub fn add_listener(
         &mut self,
         sock: std::net::TcpListener,
-        handler: Box<dyn TcpListenerHandler>,
+        handler: Box<dyn TcpListenerHandler<UserCommand>>,
     ) -> SocketKey {
         let key = self
             .socket_handlers
@@ -242,7 +259,7 @@ impl ReactorMgr {
     pub fn start_listen(
         &mut self,
         local_addr: &str,
-        handler: Box<dyn TcpListenerHandler>,
+        handler: Box<dyn TcpListenerHandler<UserCommand>>,
     ) -> std::io::Result<SocketKey> {
         let socket = std::net::TcpListener::bind(local_addr)?;
         socket.set_nonblocking(true)?;
@@ -252,7 +269,7 @@ impl ReactorMgr {
     pub fn start_connect(
         &mut self,
         remote_addr: &str,
-        handler: Box<dyn Reactor>,
+        handler: Box<dyn Reactor<UserCommand>>,
     ) -> std::io::Result<SocketKey> {
         let sockkey = {
             let socket = TcpStream::connect(remote_addr)?;
@@ -275,12 +292,12 @@ impl ReactorMgr {
     }
 }
 
-impl Default for ReactRuntime {
+impl<UserCommand> Default for ReactRuntime<UserCommand> {
     fn default() -> Self {
         Self::new()
     }
 }
-impl ReactRuntime {
+impl<UserCommand> ReactRuntime<UserCommand> {
     pub fn new() -> Self {
         Self {
             mgr: ReactorMgr::new(),
@@ -296,17 +313,18 @@ impl ReactRuntime {
     pub fn count_streams(&self) -> usize {
         self.mgr.count_streams
     }
-    pub fn get_cmd_sender(&self) -> &CmdSender {
+    pub fn get_cmd_sender(&self) -> &CmdSender<UserCommand> {
         &self.mgr.cmd_sender
     }
     pub fn send_cmd(
         &self,
         reactorid: ReactorID,
-        cmd: Command,
+        cmd: SysCommand<UserCommand>,
         deferred: Deferred,
         completion: impl FnOnce(CommandCompletion) + 'static,
-    ) {
-        self.mgr
+    ) -> bool {
+        return self
+            .mgr
             .cmd_sender
             .send_cmd(reactorid, cmd, deferred, completion);
     }
@@ -317,7 +335,7 @@ impl ReactRuntime {
     pub fn start_listen(
         &mut self,
         local_addr: &str,
-        handler: Box<dyn TcpListenerHandler>,
+        handler: Box<dyn TcpListenerHandler<UserCommand>>,
     ) -> std::io::Result<SocketKey> {
         self.mgr.start_listen(local_addr, handler)
     }
@@ -326,7 +344,7 @@ impl ReactRuntime {
     pub fn start_connect(
         &mut self,
         remote_addr: &str,
-        handler: Box<dyn Reactor>,
+        handler: Box<dyn Reactor<UserCommand>>,
     ) -> std::io::Result<SocketKey> {
         self.mgr.start_connect(remote_addr, handler)
     }
@@ -460,7 +478,7 @@ impl ReactRuntime {
     fn process_command_queue(&mut self) -> usize {
         let mut count_cmd = 0usize;
         loop {
-            let cmddata: CmdData = match self.mgr.cmd_recv.try_recv() {
+            let cmddata: CmdData<UserCommand> = match self.mgr.cmd_recv.try_recv() {
                 Err(err) => {
                     if err == std::sync::mpsc::TryRecvError::Empty {
                         return count_cmd;
@@ -479,7 +497,7 @@ impl ReactRuntime {
                         .duration_since(std::time::SystemTime::UNIX_EPOCH)
                         .unwrap()
                         .as_millis() as i64;
-                    if !ReactRuntime::is_defered_current(millis) {
+                    if !ReactRuntime::<UserCommand>::is_defered_current(millis) {
                         // if beyond half millis tolerance
                         let key = self.defered_data.add(cmddata);
                         self.defered_heap.push(DeferedKey {
@@ -501,9 +519,9 @@ impl ReactRuntime {
         return millis * 1000000 + 5 * 100000 <= now_nanos;
     }
 
-    fn execute_immediate_cmd(&mut self, cmddata: CmdData) {
+    fn execute_immediate_cmd(&mut self, cmddata: CmdData<UserCommand>) {
         match cmddata.cmd {
-            Command::NewConnect(remote_addr, reactor) => {
+            SysCommand::NewConnect(remote_addr, reactor) => {
                 match self.mgr.start_connect(&remote_addr, reactor) {
                     Err(err) => {
                         let errmsg =
@@ -515,7 +533,7 @@ impl ReactRuntime {
                     }
                 }
             }
-            Command::NewListen(local_addr, reactor) => {
+            SysCommand::NewListen(local_addr, reactor) => {
                 match self.mgr.start_listen(&local_addr, reactor) {
                     Err(err) => {
                         let errmsg = format!("Failed to listen on {}. Error: {}", local_addr, err);
@@ -526,25 +544,52 @@ impl ReactRuntime {
                     }
                 }
             }
-            Command::CloseSocket => {
+            SysCommand::CloseSocket => {
                 if self.mgr.close_by_key(cmddata.reactorid) {
                     (cmddata.completion)(CommandCompletion::Completed(cmddata.reactorid));
                 } else {
                     (cmddata.completion)(CommandCompletion::Error(format!(
-                        "Failed to remove non exist socket with key: {}",
+                        "Failed to remove non existing socket with key: {}",
                         cmddata.reactorid.0
                     )));
                 }
             }
-            _ => {
-                panic!("TODO: support other command types!");
+            SysCommand::UserCmd(usercmd) => {
+                if cmddata.reactorid == INVALID_REACTOR_ID {
+                    panic!("UserCommand must be executed on a reactor!");
+                } else {
+                    if let Some(handler) = self.mgr.socket_handlers.get_mut(cmddata.reactorid.0) {
+                        match handler {
+                            TcpSocketHandler::ListenerType(_, _) => {
+                                (cmddata.completion)(CommandCompletion::Error(format!(
+                                    "Listener cannot receive user command. reactorid: {}",
+                                    cmddata.reactorid.0
+                                )));
+                            }
+                            TcpSocketHandler::StreamType(ref mut ctx, ref mut reactor) => {
+                                (reactor).on_command(
+                                    usercmd,
+                                    &mut ReactorContext::from(ctx, &self.mgr.cmd_sender),
+                                );
+                                (cmddata.completion)(CommandCompletion::Completed(
+                                    cmddata.reactorid,
+                                ));
+                            }
+                        }
+                    } else {
+                        (cmddata.completion)(CommandCompletion::Error(format!(
+                            "Failed to execute user command on non existing socket with key: {}",
+                            cmddata.reactorid.0
+                        )));
+                    }
+                }
             }
         } // match cmd
     }
 
     fn process_defered_queue(&mut self) -> usize {
         while self.defered_heap.len() > 0
-            && ReactRuntime::is_defered_current(self.defered_heap[0].millis)
+            && ReactRuntime::<UserCommand>::is_defered_current(self.defered_heap[0].millis)
         {
             let key = self.defered_heap[0].data;
             min_heap_pop(&mut self.defered_heap);
@@ -576,19 +621,15 @@ impl ReactRuntime {
 }
 
 //====================================================================================
-//            Command to Reactor
+//            SysCommand to Reactor
 //====================================================================================
 
-pub enum Command {
+pub enum SysCommand<UserCommand> {
     //-- system commands are processed by Runtime, Reactor will not receive them.
-    NewConnect(String, Box<dyn Reactor>), // connect to remote IP:Port
-    NewListen(String, Box<dyn TcpListenerHandler>), // listen on IP:Port
+    NewConnect(String, Box<dyn Reactor<UserCommand>>), // connect to remote IP:Port
+    NewListen(String, Box<dyn TcpListenerHandler<UserCommand>>), // listen on IP:Port
     CloseSocket,
-    //-- below command are passed to reactor if ReactorID/SocketKey is specified.
-    UserStr(String),
-    UserInt(i64),
-    UserFn(Box<dyn FnOnce()>),
-    UserAny(Box<dyn std::any::Any>),
+    UserCmd(UserCommand),
 }
 
 pub enum Deferred {
@@ -600,48 +641,56 @@ pub enum CommandCompletion {
     Error(String),
 }
 
-pub struct CmdData {
+pub struct CmdData<UserCommand> {
     reactorid: ReactorID,
-    cmd: Command,
+    cmd: SysCommand<UserCommand>,
     deferred: Deferred,
     completion: Box<dyn FnOnce(CommandCompletion)>,
 }
-unsafe impl Send for CmdData {}
+unsafe impl<UserCommand> Send for CmdData<UserCommand> {}
 
-trait ReactorCmdSender {
+trait ReactorCmdSender<UserCommand> {
     fn send_cmd(
         &self,
         reactorid: ReactorID,
-        cmd: Command,
+        cmd: SysCommand<UserCommand>,
         deferred: Deferred,
         completion: impl FnOnce(CommandCompletion) + 'static,
-    );
+    ) -> bool;
 }
 
-impl ReactorCmdSender for CmdSender {
+impl<UserCommand> ReactorCmdSender<UserCommand> for CmdSender<UserCommand> {
     fn send_cmd(
         &self,
         reactorid: ReactorID,
-        cmd: Command,
+        cmd: SysCommand<UserCommand>,
         deferred: Deferred,
         completion: impl FnOnce(CommandCompletion) + 'static,
-    ) {
+    ) -> bool {
         // check NewConnect/NewListen when reactor == INVALID.
         match &cmd {
-            Command::NewListen(_, _) | Command::NewConnect(_, _) => {
+            SysCommand::NewListen(_, _) | SysCommand::NewConnect(_, _) => {
                 if reactorid != INVALID_REACTOR_ID {
-                    panic!("reactorid msut be INVALID_REACTOR_ID if NewConnect/NewListen");
+                    logmsg!("reactorid msut be INVALID_REACTOR_ID if NewConnect/NewListen");
+                    return false;
+                }
+            }
+            SysCommand::UserCmd(_) => {
+                if reactorid == INVALID_REACTOR_ID {
+                    logmsg!("UserCmd must has a valid reactorid.");
+                    return false;
                 }
             }
             _ => {}
         }
-        self.send(CmdData {
+        self.send(CmdData::<UserCommand> {
             reactorid: reactorid,
             cmd: cmd,
             deferred: deferred,
             completion: Box::new(completion),
         })
         .unwrap();
+        return true;
     }
 }
 
@@ -842,7 +891,7 @@ impl MsgSender {
 //            MsgReader
 //====================================================================================
 
-pub trait MsgDispatcher {
+pub trait MsgDispatcher<UserCommand> {
     /// dispatch msg.
     /// @param msg_size  the decoded message size which is return value of previous call of dispatch. 0 means message having not been decoded.
     /// @return ExpectMsgSize(msgsize) to indicate more read until full msgsize is read then call next dispatch. msgsize==0 means msg size is unknown.
@@ -851,18 +900,18 @@ pub trait MsgDispatcher {
         &mut self,
         buf: &mut [u8],
         msg_size: usize,
-        ctx: &mut DispatchContext,
+        ctx: &mut DispatchContext<UserCommand>,
     ) -> DispatchResult;
 }
 
-pub struct DispatchContext<'a> {
+pub struct DispatchContext<'a, UserCommand> {
     pub sock: &'a mut std::net::TcpStream,
     pub sender: &'a mut MsgSender, // socker sender
-    pub cmd_sender: &'a CmdSender,
+    pub cmd_sender: &'a CmdSender<UserCommand>,
 }
 
 pub enum DispatchResult {
-    Error,
+    Error,                // Error. Exit reading message.
     ExpectMsgSize(usize), // expecting more read, indicating expected size, dispatcher will not be called until specified msg bytes are read. size==0 means unknown size.
     DropMsgSize(usize),   // msg has been dispatched, indicating bytes to drop.
 }
@@ -899,7 +948,11 @@ impl MsgReader {
     /// @return ExpectMsgSize(msgsize) to indicate more read until full msgsize is read then call next dispatch. msgsize==0 means msg size is unknown.
     ///         DropMsgSize(msgsize) to indiciate message is processed already. framework can drop the message after call. then msgsize will be 0 again.
     ///
-    fn try_read(&mut self, ctx: &mut DispatchContext, dispatcher: &mut impl MsgDispatcher) -> bool {
+    fn try_read<UserCommand>(
+        &mut self,
+        ctx: &mut DispatchContext<UserCommand>,
+        dispatcher: &mut impl MsgDispatcher<UserCommand>,
+    ) -> bool {
         loop {
             debug_assert!(
                 self.decoded_msgsize == 0 || self.decoded_msgsize > self.bufsize - self.startpos
@@ -985,33 +1038,37 @@ impl MsgReader {
 //====================================================================================
 //         Default TcpListenerHandler
 //====================================================================================
-pub struct DefaultTcpListenerHandler<StreamHandler> {
+pub struct DefaultTcpListenerHandler<UserCommand, StreamHandler> {
     _phantom: PhantomData<StreamHandler>,
+    _phantom1: PhantomData<UserCommand>,
 }
 
-impl<StreamHandler: Reactor + Default + 'static> DefaultTcpListenerHandler<StreamHandler> {
+impl<UserCommand, StreamHandler: Reactor<UserCommand> + Default + 'static>
+    DefaultTcpListenerHandler<UserCommand, StreamHandler>
+{
     pub fn new_boxed() -> Box<Self> {
         Box::new(Self::default())
     }
 }
-impl<StreamHandler: Reactor + Default + 'static> Default
-    for DefaultTcpListenerHandler<StreamHandler>
+impl<UserCommand, StreamHandler: Reactor<UserCommand> + Default + 'static> Default
+    for DefaultTcpListenerHandler<UserCommand, StreamHandler>
 {
     fn default() -> Self {
         Self {
             _phantom: PhantomData::default(),
+            _phantom1: PhantomData::default(),
         }
     }
 }
-impl<StreamHandler: Reactor + Default + 'static> TcpListenerHandler
-    for DefaultTcpListenerHandler<StreamHandler>
+impl<UserCommand, StreamHandler: Reactor<UserCommand> + Default + 'static>
+    TcpListenerHandler<UserCommand> for DefaultTcpListenerHandler<UserCommand, StreamHandler>
 {
     fn on_new_connection(
         &mut self,
         _conn: &mut std::net::TcpListener,
         _new_conn: &mut std::net::TcpStream,
         _addr: std::net::SocketAddr,
-    ) -> Option<Box<dyn Reactor>> {
+    ) -> Option<Box<dyn Reactor<UserCommand>>> {
         Some(Box::new(StreamHandler::default()))
     }
 }
@@ -1020,7 +1077,7 @@ impl<StreamHandler: Reactor + Default + 'static> TcpListenerHandler
 //            MyReactor
 //====================================================================================
 
-pub mod sample {
+pub mod example {
     use super::*;
 
     #[derive(Copy, Clone)]
@@ -1030,6 +1087,8 @@ pub mod sample {
     }
     const MSG_HEADER_SIZE: usize = 10;
     const LATENCY_BATCH_SIZE: i32 = 10000;
+
+    pub type MyUserCommand = String;
 
     pub struct MyReactor {
         dispatcher: EchoAndLatency, // reader & dispacther must be decoupled, in order to avoid double mutable reference of self.
@@ -1050,12 +1109,12 @@ pub mod sample {
         pub single_trip_durations: Vec<i64>,
         pub round_trip_durations: Vec<i64>,
     }
-    impl MsgDispatcher for EchoAndLatency {
+    impl MsgDispatcher<MyUserCommand> for EchoAndLatency {
         fn dispatch(
             &mut self,
             buf: &mut [u8],
             msg_size: usize,
-            ctx: &mut DispatchContext,
+            ctx: &mut DispatchContext<MyUserCommand>,
         ) -> DispatchResult {
             let mut msg_size = msg_size;
             if msg_size == 0 {
@@ -1177,8 +1236,12 @@ pub mod sample {
         }
     }
 
-    impl Reactor for MyReactor {
-        fn on_connected(&mut self, ctx: &mut ReactorContext, listener: ReactorID) -> bool {
+    impl Reactor<MyUserCommand> for MyReactor {
+        fn on_connected(
+            &mut self,
+            ctx: &mut ReactorContext<MyUserCommand>,
+            listener: ReactorID,
+        ) -> bool {
             self.dispatcher.parent_listener = listener;
             if self.dispatcher.is_client {
                 logmsg!("client sock: {:?} connected.", ctx.sock);
@@ -1205,7 +1268,7 @@ pub mod sample {
                 // if it's not client. close parent listener socket.
                 ctx.cmd_sender.send_cmd(
                     self.dispatcher.parent_listener,
-                    Command::CloseSocket,
+                    SysCommand::CloseSocket,
                     Deferred::Immediate,
                     |_res| {},
                 );
@@ -1215,7 +1278,7 @@ pub mod sample {
             return true;
         }
 
-        fn on_readable(&mut self, ctx: &mut ReactorContext) -> bool {
+        fn on_readable(&mut self, ctx: &mut ReactorContext<MyUserCommand>) -> bool {
             if !ctx.reader.try_read(
                 &mut DispatchContext {
                     sock: &mut ctx.sock,
@@ -1236,6 +1299,9 @@ pub mod sample {
             }
             return true;
         }
+        fn on_command(&mut self, cmd: MyUserCommand, ctx: &mut ReactorContext<MyUserCommand>) {
+            logmsg!("Reactor {} recv cmd: {}", ctx.sockkey.0, cmd);
+        }
     }
 }
 
@@ -1250,11 +1316,12 @@ mod test {
         runtime
             .start_listen(
                 addr,
-                DefaultTcpListenerHandler::<sample::MyReactor>::new_boxed(),
+                DefaultTcpListenerHandler::<example::MyUserCommand, example::MyReactor>::new_boxed(
+                ),
             )
             .unwrap();
         runtime
-            .start_connect(addr, sample::MyReactor::new_client(2, 1000))
+            .start_connect(addr, example::MyReactor::new_client(2, 1000))
             .unwrap();
         while runtime.process_events() {}
         assert_eq!(runtime.len(), 0);
@@ -1265,16 +1332,17 @@ mod test {
         let mut runtime = ReactRuntime::new();
         runtime.send_cmd(
             INVALID_REACTOR_ID,
-            Command::NewListen(
+            SysCommand::NewListen(
                 addr.to_owned(),
-                DefaultTcpListenerHandler::<sample::MyReactor>::new_boxed(),
+                DefaultTcpListenerHandler::<example::MyUserCommand, example::MyReactor>::new_boxed(
+                ),
             ),
             Deferred::Immediate,
             |_| {},
         );
         runtime.send_cmd(
             INVALID_REACTOR_ID,
-            Command::NewConnect(addr.to_owned(), sample::MyReactor::new_client(2, 1000)),
+            SysCommand::NewConnect(addr.to_owned(), example::MyReactor::new_client(2, 1000)),
             Deferred::Immediate,
             |_| {},
         );

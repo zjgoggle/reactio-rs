@@ -1,4 +1,4 @@
-use reactio::{sample, DefaultTcpListenerHandler, ReactRuntime};
+use reactio::{example, DefaultTcpListenerHandler, ReactRuntime};
 
 fn run(port: i32) {
     let addr = "127.0.0.1:".to_owned() + &port.to_string();
@@ -6,7 +6,7 @@ fn run(port: i32) {
     runtime
         .start_listen(
             &addr,
-            DefaultTcpListenerHandler::<sample::MyReactor>::new_boxed(),
+            DefaultTcpListenerHandler::<example::MyUserCommand, example::MyReactor>::new_boxed(),
         )
         .unwrap();
     while runtime.process_events() {}
