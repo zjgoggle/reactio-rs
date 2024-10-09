@@ -49,7 +49,53 @@ pub trait TcpListenerHandler {
 /// ReactRuntime manages TCP connections & polling.
 pub struct ReactRuntime {
     mgr: ReactorMgr,
+    defered_data: FlatStorage<CmdData>,
+    defered_heap: Vec<DeferedKey>, // min heap of (scheduled_time_nanos, Cmd_index_in_defered_data)
     events: Events, // decoupled events and connections to avoid double mutable refererence.
+}
+
+#[derive(Copy, Clone)]
+struct DeferedKey {
+    millis: i64,
+    data: usize,
+}
+impl DeferedKey {
+    fn get_key(&self) -> i64 {
+        return self.millis;
+    }
+}
+
+// push the last element to a min heap. sift up
+fn min_heap_push(v: &mut [DeferedKey]) {
+    let mut k = v.len() - 1; // last element
+    let mut parent = (k - 1) / 2;
+    while k > 0 && v[k].get_key() < v[parent].get_key() {
+        v.swap(k, parent);
+        k = parent;
+        parent = (k - 1) / 2;
+    }
+}
+// pop the first element to end. sift down.
+fn min_heap_pop(v: &mut [DeferedKey]) {
+    let mut k = 0;
+    let value = v[0];
+    while k < v.len() - 1 {
+        let (l, r) = ((k + 1) * 2 - 1, (k + 1) * 2);
+        let min = if r < v.len() - 1 {
+            if v[l].get_key() < v[r].get_key() {
+                l
+            } else {
+                r
+            }
+        } else if l < v.len() - 1 {
+            l
+        } else {
+            break;
+        };
+        v.swap(min, k);
+        k = min;
+    }
+    v[v.len() - 1] = value;
 }
 
 // Make a seperate struct ReactorMgr because when interating TcpConnectionMgr::events, sessions must be mutable in process_events.
@@ -238,6 +284,8 @@ impl ReactRuntime {
     pub fn new() -> Self {
         Self {
             mgr: ReactorMgr::new(),
+            defered_data: FlatStorage::new(),
+            defered_heap: Vec::new(),
             events: Events::new(),
         }
     }
@@ -409,7 +457,7 @@ impl ReactRuntime {
     }
 
     /// @return number of command procesed
-    fn process_commands(&mut self) -> usize {
+    fn process_command_queue(&mut self) -> usize {
         let mut count_cmd = 0usize;
         loop {
             let cmddata: CmdData = match self.mgr.cmd_recv.try_recv() {
@@ -426,60 +474,104 @@ impl ReactRuntime {
 
             match cmddata.deferred {
                 Deferred::Immediate => {}
-                _ => {
-                    panic!("TODO: support deferred command");
-                    // TODO: save to defered cmd queue.
+                Deferred::UtilTime(time) => {
+                    let millis = time
+                        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                        .unwrap()
+                        .as_millis() as i64;
+                    if !ReactRuntime::is_defered_current(millis) {
+                        // if beyond half millis tolerance
+                        let key = self.defered_data.add(cmddata);
+                        self.defered_heap.push(DeferedKey {
+                            millis: millis,
+                            data: key,
+                        });
+                        min_heap_push(&mut self.defered_heap);
+                        continue; // continue loop recv
+                    }
                 }
             }
 
-            match cmddata.cmd {
-                Command::NewConnect(remote_addr, reactor) => {
-                    match self.mgr.start_connect(&remote_addr, reactor) {
-                        Err(err) => {
-                            let errmsg =
-                                format!("Failed to connect to {}. Error: {}", remote_addr, err);
-                            (cmddata.completion)(CommandCompletion::Error(errmsg));
-                        }
-                        Ok(key) => {
-                            (cmddata.completion)(CommandCompletion::Completed(key));
-                        }
-                    }
-                }
-                Command::NewListen(local_addr, reactor) => {
-                    match self.mgr.start_listen(&local_addr, reactor) {
-                        Err(err) => {
-                            let errmsg =
-                                format!("Failed to listen on {}. Error: {}", local_addr, err);
-                            (cmddata.completion)(CommandCompletion::Error(errmsg));
-                        }
-                        Ok(key) => {
-                            (cmddata.completion)(CommandCompletion::Completed(key));
-                        }
-                    }
-                }
-                Command::CloseSocket => {
-                    if self.mgr.close_by_key(cmddata.reactorid) {
-                        (cmddata.completion)(CommandCompletion::Completed(cmddata.reactorid));
-                    } else {
-                        (cmddata.completion)(CommandCompletion::Error(format!(
-                            "Failed to remove non exist socket with key: {}",
-                            cmddata.reactorid.0
-                        )));
-                    }
-                }
-                _ => {
-                    panic!("TODO: support other command types!");
-                }
-            } // match cmd
+            self.execute_immediate_cmd(cmddata);
         } // loop
     }
 
+    fn is_defered_current(millis: i64) -> bool {
+        let now_nanos = utils::now_nanos();
+        return millis * 1000000 + 5 * 100000 <= now_nanos;
+    }
+
+    fn execute_immediate_cmd(&mut self, cmddata: CmdData) {
+        match cmddata.cmd {
+            Command::NewConnect(remote_addr, reactor) => {
+                match self.mgr.start_connect(&remote_addr, reactor) {
+                    Err(err) => {
+                        let errmsg =
+                            format!("Failed to connect to {}. Error: {}", remote_addr, err);
+                        (cmddata.completion)(CommandCompletion::Error(errmsg));
+                    }
+                    Ok(key) => {
+                        (cmddata.completion)(CommandCompletion::Completed(key));
+                    }
+                }
+            }
+            Command::NewListen(local_addr, reactor) => {
+                match self.mgr.start_listen(&local_addr, reactor) {
+                    Err(err) => {
+                        let errmsg = format!("Failed to listen on {}. Error: {}", local_addr, err);
+                        (cmddata.completion)(CommandCompletion::Error(errmsg));
+                    }
+                    Ok(key) => {
+                        (cmddata.completion)(CommandCompletion::Completed(key));
+                    }
+                }
+            }
+            Command::CloseSocket => {
+                if self.mgr.close_by_key(cmddata.reactorid) {
+                    (cmddata.completion)(CommandCompletion::Completed(cmddata.reactorid));
+                } else {
+                    (cmddata.completion)(CommandCompletion::Error(format!(
+                        "Failed to remove non exist socket with key: {}",
+                        cmddata.reactorid.0
+                    )));
+                }
+            }
+            _ => {
+                panic!("TODO: support other command types!");
+            }
+        } // match cmd
+    }
+
+    fn process_defered_queue(&mut self) -> usize {
+        while self.defered_heap.len() > 0
+            && ReactRuntime::is_defered_current(self.defered_heap[0].millis)
+        {
+            let key = self.defered_heap[0].data;
+            min_heap_pop(&mut self.defered_heap);
+            self.defered_heap.pop();
+            if let Some(cmddata) = self.defered_data.remove(key) {
+                self.execute_immediate_cmd(cmddata);
+            } else {
+                panic!("No defered CommandData with key: {}", key);
+            }
+        }
+        return 0;
+    }
+
     /// This function should be periodically called to process socket messages and commands.
-    /// @return true if the runtime has reactor or command; false when there's no reactor/socket or command, then this runtime could be destroyed.
+    /// @return true if the runtime has reactor or command;
+    ///     false when there's no reactor/socket or command, then this runtime could be destroyed.
+    ///     But cloned senders may still send cmd before destruction. User must handle this race condition.
     pub fn process_events(&mut self) -> bool {
         let has_events = self.process_sock_events();
-        let cmds = self.process_commands();
-        return has_events || cmds > 0 || self.len() > 0; // TODO or there are defered commands.
+        let defereds = self.process_defered_queue();
+        let cmds = self.process_command_queue();
+        return has_events
+            || defereds > 0
+            || cmds > 0
+            || self.defered_heap.len() > 0
+            || self.len() > 0;
+        // TODO or there are defered commands.
     }
 }
 
@@ -492,15 +584,15 @@ pub enum Command {
     NewConnect(String, Box<dyn Reactor>), // connect to remote IP:Port
     NewListen(String, Box<dyn TcpListenerHandler>), // listen on IP:Port
     CloseSocket,
-    //-- below command are passed to reactor
-    // UserStr(String),
-    // UserInt(i64),
-    // UserFn(Box<dyn Fn()>),
+    //-- below command are passed to reactor if ReactorID/SocketKey is specified.
+    UserStr(String),
+    UserInt(i64),
+    UserFn(Box<dyn FnOnce()>),
+    UserAny(Box<dyn std::any::Any>),
 }
 
 pub enum Deferred {
     Immediate,
-    ForTime(std::time::Duration),
     UtilTime(std::time::SystemTime),
 }
 pub enum CommandCompletion {
