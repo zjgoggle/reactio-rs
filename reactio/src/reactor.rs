@@ -16,19 +16,25 @@ use std::{marker::PhantomData, net::TcpStream};
 /// A Reactor is assigned a unique ReactorID by ReactRuntime, and is able to receive socket messsages (via reader) and commands.
 /// Besides socket communication, Sending command is the only thread-safe way to communicate with a Reactor.
 /// A Reactor could send socket messages (via sender), and send commands (via cmd_sender) to another Reactor with specific ReactorID.
-pub trait Reactor<UserCommand> {
+pub trait Reactor {
+    type UserCommand;
+
     /// called when connection is established.
     /// @param listener the listener ID when the reactor is created by a listener socket; otherwise, it's INVALID_REACTOR_ID.
-    fn on_connected(&mut self, ctx: &mut ReactorContext<UserCommand>, listener: ReactorID) -> bool;
+    fn on_connected(
+        &mut self,
+        ctx: &mut ReactorContext<Self::UserCommand>,
+        listener: ReactorID,
+    ) -> bool;
 
     /// \return false to close socket.
-    fn on_readable(&mut self, ctx: &mut ReactorContext<UserCommand>) -> bool;
+    fn on_readable(&mut self, ctx: &mut ReactorContext<Self::UserCommand>) -> bool;
 
-    fn on_command(&mut self, cmd: UserCommand, ctx: &mut ReactorContext<UserCommand>);
+    fn on_command(&mut self, cmd: Self::UserCommand, ctx: &mut ReactorContext<Self::UserCommand>);
 
     /// called when the reactor is removed from poller and before closing the socket.
     /// The Reactor will be destroyed after this call.
-    fn on_close(&mut self, _cmd_sender: &CmdSender<UserCommand>) {}
+    fn on_close(&mut self, _cmd_sender: &CmdSender<Self::UserCommand>) {}
 }
 
 pub type CmdSender<UserCommand> = std::sync::mpsc::Sender<CmdData<UserCommand>>;
@@ -39,16 +45,17 @@ pub struct ReactorContext<'a, UserCommand> {
     pub reader: &'a mut MsgReader, // sock_reader
     pub cmd_sender: &'a CmdSender<UserCommand>,
 }
-pub trait TcpListenerHandler<UserCommand> {
+pub trait TcpListenerHandler {
+    type UserCommand;
     /// \return null to close new connection.
     fn on_new_connection(
         &mut self,
         sock: &mut std::net::TcpListener,
         new_sock: &mut std::net::TcpStream,
         addr: std::net::SocketAddr,
-    ) -> Option<Box<dyn Reactor<UserCommand>>>;
+    ) -> Option<Box<dyn Reactor<UserCommand = Self::UserCommand>>>;
 
-    fn on_close(&mut self, _cmd_sender: &CmdSender<UserCommand>) {}
+    fn on_close(&mut self, _cmd_sender: &CmdSender<Self::UserCommand>) {}
 }
 
 /// ReactRuntime manages Reactors which receive socket data or command.
@@ -125,9 +132,9 @@ struct ReactorMgr<UserCommand> {
 enum TcpSocketHandler<UserCommand> {
     ListenerType(
         std::net::TcpListener,
-        Box<dyn TcpListenerHandler<UserCommand>>,
+        Box<dyn TcpListenerHandler<UserCommand = UserCommand>>,
     ), // <sock, handler, key_in_flat_storage>
-    StreamType(SockData, Box<dyn Reactor<UserCommand>>),
+    StreamType(SockData, Box<dyn Reactor<UserCommand = UserCommand>>),
 }
 pub struct SockData {
     pub sockkey: SocketKey,
@@ -173,7 +180,7 @@ impl<UserCommand> ReactorMgr<UserCommand> {
     pub fn add_stream<'a>(
         &'a mut self,
         sock: std::net::TcpStream,
-        handler: Box<dyn Reactor<UserCommand>>,
+        handler: Box<dyn Reactor<UserCommand = UserCommand>>,
     ) -> SocketKey {
         let key = self.socket_handlers.add(TcpSocketHandler::StreamType(
             SockData {
@@ -207,7 +214,7 @@ impl<UserCommand> ReactorMgr<UserCommand> {
     pub fn add_listener(
         &mut self,
         sock: std::net::TcpListener,
-        handler: Box<dyn TcpListenerHandler<UserCommand>>,
+        handler: Box<dyn TcpListenerHandler<UserCommand = UserCommand>>,
     ) -> SocketKey {
         let key = self
             .socket_handlers
@@ -259,7 +266,7 @@ impl<UserCommand> ReactorMgr<UserCommand> {
     pub fn start_listen(
         &mut self,
         local_addr: &str,
-        handler: Box<dyn TcpListenerHandler<UserCommand>>,
+        handler: Box<dyn TcpListenerHandler<UserCommand = UserCommand>>,
     ) -> std::io::Result<SocketKey> {
         let socket = std::net::TcpListener::bind(local_addr)?;
         socket.set_nonblocking(true)?;
@@ -269,7 +276,7 @@ impl<UserCommand> ReactorMgr<UserCommand> {
     pub fn start_connect(
         &mut self,
         remote_addr: &str,
-        handler: Box<dyn Reactor<UserCommand>>,
+        handler: Box<dyn Reactor<UserCommand = UserCommand>>,
     ) -> std::io::Result<SocketKey> {
         let sockkey = {
             let socket = TcpStream::connect(remote_addr)?;
@@ -335,7 +342,7 @@ impl<UserCommand> ReactRuntime<UserCommand> {
     pub fn start_listen(
         &mut self,
         local_addr: &str,
-        handler: Box<dyn TcpListenerHandler<UserCommand>>,
+        handler: Box<dyn TcpListenerHandler<UserCommand = UserCommand>>,
     ) -> std::io::Result<SocketKey> {
         self.mgr.start_listen(local_addr, handler)
     }
@@ -344,7 +351,7 @@ impl<UserCommand> ReactRuntime<UserCommand> {
     pub fn start_connect(
         &mut self,
         remote_addr: &str,
-        handler: Box<dyn Reactor<UserCommand>>,
+        handler: Box<dyn Reactor<UserCommand = UserCommand>>,
     ) -> std::io::Result<SocketKey> {
         self.mgr.start_connect(remote_addr, handler)
     }
@@ -626,8 +633,11 @@ impl<UserCommand> ReactRuntime<UserCommand> {
 
 pub enum SysCommand<UserCommand> {
     //-- system commands are processed by Runtime, Reactor will not receive them.
-    NewConnect(String, Box<dyn Reactor<UserCommand>>), // connect to remote IP:Port
-    NewListen(String, Box<dyn TcpListenerHandler<UserCommand>>), // listen on IP:Port
+    NewConnect(String, Box<dyn Reactor<UserCommand = UserCommand>>), // connect to remote IP:Port
+    NewListen(
+        String,
+        Box<dyn TcpListenerHandler<UserCommand = UserCommand>>,
+    ), // listen on IP:Port
     CloseSocket,
     UserCmd(UserCommand),
 }
@@ -1038,37 +1048,35 @@ impl MsgReader {
 //====================================================================================
 //         Default TcpListenerHandler
 //====================================================================================
-pub struct DefaultTcpListenerHandler<UserCommand, StreamHandler> {
+pub struct DefaultTcpListenerHandler<StreamHandler> {
     _phantom: PhantomData<StreamHandler>,
-    _phantom1: PhantomData<UserCommand>,
 }
 
-impl<UserCommand, StreamHandler: Reactor<UserCommand> + Default + 'static>
-    DefaultTcpListenerHandler<UserCommand, StreamHandler>
-{
+impl<StreamHandler: Reactor + Default + 'static> DefaultTcpListenerHandler<StreamHandler> {
     pub fn new_boxed() -> Box<Self> {
         Box::new(Self::default())
     }
 }
-impl<UserCommand, StreamHandler: Reactor<UserCommand> + Default + 'static> Default
-    for DefaultTcpListenerHandler<UserCommand, StreamHandler>
+impl<StreamHandler: Reactor + Default + 'static> Default
+    for DefaultTcpListenerHandler<StreamHandler>
 {
     fn default() -> Self {
         Self {
             _phantom: PhantomData::default(),
-            _phantom1: PhantomData::default(),
         }
     }
 }
-impl<UserCommand, StreamHandler: Reactor<UserCommand> + Default + 'static>
-    TcpListenerHandler<UserCommand> for DefaultTcpListenerHandler<UserCommand, StreamHandler>
+impl<StreamHandler: Reactor + Default + 'static> TcpListenerHandler
+    for DefaultTcpListenerHandler<StreamHandler>
 {
+    type UserCommand = <StreamHandler as Reactor>::UserCommand;
+
     fn on_new_connection(
         &mut self,
         _conn: &mut std::net::TcpListener,
         _new_conn: &mut std::net::TcpStream,
         _addr: std::net::SocketAddr,
-    ) -> Option<Box<dyn Reactor<UserCommand>>> {
+    ) -> Option<Box<dyn Reactor<UserCommand = <StreamHandler as Reactor>::UserCommand>>> {
         Some(Box::new(StreamHandler::default()))
     }
 }
@@ -1236,7 +1244,9 @@ pub mod example {
         }
     }
 
-    impl Reactor<MyUserCommand> for MyReactor {
+    impl Reactor for MyReactor {
+        type UserCommand = MyUserCommand; // mut
+
         fn on_connected(
             &mut self,
             ctx: &mut ReactorContext<MyUserCommand>,
@@ -1316,8 +1326,7 @@ mod test {
         runtime
             .start_listen(
                 addr,
-                DefaultTcpListenerHandler::<example::MyUserCommand, example::MyReactor>::new_boxed(
-                ),
+                DefaultTcpListenerHandler::<example::MyReactor>::new_boxed(),
             )
             .unwrap();
         runtime
@@ -1334,8 +1343,7 @@ mod test {
             INVALID_REACTOR_ID,
             SysCommand::NewListen(
                 addr.to_owned(),
-                DefaultTcpListenerHandler::<example::MyUserCommand, example::MyReactor>::new_boxed(
-                ),
+                DefaultTcpListenerHandler::<example::MyReactor>::new_boxed(),
             ),
             Deferred::Immediate,
             |_| {},
