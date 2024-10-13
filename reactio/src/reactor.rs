@@ -39,7 +39,113 @@ pub trait Reactor {
     fn on_close(&mut self, _cmd_sender: &CmdSender<Self::UserCommand>) {}
 }
 
-pub type CmdSender<UserCommand> = std::sync::mpsc::Sender<CmdData<UserCommand>>;
+pub enum Deferred {
+    Immediate,
+    UtilTime(std::time::SystemTime),
+}
+pub enum CommandCompletion {
+    Completed(ReactorID),
+    Error(String),
+}
+
+/// CmdSender is owned by a ReactorRuntime. Users send commands to a reactor with speficic ReactorID.
+pub struct CmdSender<UserCommand>(std::sync::mpsc::Sender<CmdData<UserCommand>>);
+impl<UserCommand> Clone for CmdSender<UserCommand> {
+    fn clone(&self) -> Self {
+        Self { 0: self.0.clone() }
+    }
+}
+impl<UserCommand> CmdSender<UserCommand> {
+    /// Send a command to create a socket to connect to remote IP:Port. The reactor will receive socket messages once connected.
+    pub fn send_connect<AReactor: Reactor<UserCommand = UserCommand> + 'static>(
+        &self,
+        remote_addr: &str,
+        reactor: AReactor,
+        deferred: Deferred,
+        completion: impl FnOnce(CommandCompletion) + 'static,
+    ) -> Result<(), String> {
+        return self.send_cmd(
+            INVALID_REACTOR_ID,
+            SysCommand::NewConnect(remote_addr.to_owned(), Box::new(reactor)),
+            deferred,
+            completion,
+        );
+    }
+    /// Send a command to create a listen socket at IP:Port. The reactor will listen on the socket.
+    pub fn send_listen<AReactor: TcpListenerHandler<UserCommand = UserCommand> + 'static>(
+        &self,
+        local_addr: &str,
+        reactor: AReactor,
+        deferred: Deferred,
+        completion: impl FnOnce(CommandCompletion) + 'static,
+    ) -> Result<(), String> {
+        return self.send_cmd(
+            INVALID_REACTOR_ID,
+            SysCommand::NewListen(local_addr.to_owned(), Box::new(reactor)),
+            deferred,
+            completion,
+        );
+    }
+
+    /// Send a command to close a reactor and it's socket.
+    pub fn send_close(
+        &self,
+        reactorid: ReactorID,
+        deferred: Deferred,
+        completion: impl FnOnce(CommandCompletion) + 'static,
+    ) -> Result<(), String> {
+        return self.send_cmd(reactorid, SysCommand::CloseSocket, deferred, completion);
+    }
+
+    pub fn send_user_cmd(
+        &self,
+        reactorid: ReactorID,
+        cmd: UserCommand,
+        deferred: Deferred,
+        completion: impl FnOnce(CommandCompletion) + 'static,
+    ) -> Result<(), String> {
+        return self.send_cmd(reactorid, SysCommand::UserCmd(cmd), deferred, completion);
+    }
+
+    fn send_cmd(
+        &self,
+        reactorid: ReactorID,
+        cmd: SysCommand<UserCommand>,
+        deferred: Deferred,
+        completion: impl FnOnce(CommandCompletion) + 'static,
+    ) -> Result<(), String> {
+        // check NewConnect/NewListen when reactor == INVALID.
+        match &cmd {
+            SysCommand::NewListen(_, _) | SysCommand::NewConnect(_, _) => {
+                if reactorid != INVALID_REACTOR_ID {
+                    return Err(
+                        "reactorid msut be INVALID_REACTOR_ID if NewConnect/NewListen".to_owned(),
+                    );
+                }
+            }
+            SysCommand::UserCmd(_) => {
+                if reactorid == INVALID_REACTOR_ID {
+                    return Err("UserCmd must has a valid reactorid.".to_owned());
+                }
+                // the reactor id must exist, which is checked when runtime processes the command.
+            }
+            _ => {}
+        }
+        match self.0.send(CmdData::<UserCommand> {
+            reactorid: reactorid,
+            cmd: cmd,
+            deferred: deferred,
+            completion: Box::new(completion),
+        }) {
+            Err(_) => {
+                return Err("Failed to send. Receiver disconnected.".to_owned());
+            }
+            _ => {}
+        }
+        return Ok(());
+    }
+}
+
 pub struct ReactorContext<'a, UserCommand> {
     pub reactorid: ReactorID,
     pub sock: &'a mut std::net::TcpStream,
@@ -65,10 +171,10 @@ pub trait TcpListenerHandler {
 }
 
 /// ReactRuntime manages Reactors which receive socket data or command.
-/// A ReactRuntime has a command queue, defered command queue and a collection of reactors.
+/// A ReactRuntime has a command queue, deferred command queue and a collection of reactors.
 /// Each reactor is assigned a ReactorID when adding to ReactRuntime. Users send command to a reactor
 /// with a specific ReactorID that belongs to the ReactRuntime. If it's INVALID_REACTOR_ID,
-/// The command will not be passed to a reactor. The command could be immediate or defered for a time.
+/// The command will not be passed to a reactor. The command could be immediate or deferred for a time.
 /// A example is that, on close of a reactor, it could send a command to the ReactRuntime to reconnect.
 ///
 /// Communication between ReactRuntimes are via sending command also, which is the only thread-safe way.
@@ -76,24 +182,24 @@ pub trait TcpListenerHandler {
 /// Also multiple ReactRuntime in a thread is feasible, but is not needed.
 pub struct ReactRuntime<UserCommand> {
     mgr: ReactorMgr<UserCommand>,
-    defered_data: FlatStorage<CmdData<UserCommand>>,
-    defered_heap: Vec<DeferedKey>, // min heap of (scheduled_time_nanos, Cmd_index_in_defered_data)
-    events: Events, // decoupled events and connections to avoid double mutable refererence.
+    deferred_data: FlatStorage<CmdData<UserCommand>>,
+    deferred_heap: Vec<DeferredKey>, // min heap of (scheduled_time_nanos, Cmd_index_in_deferred_data)
+    sock_events: Events, // decoupled events and connections to avoid double mutable refererence.
 }
 
 #[derive(Copy, Clone)]
-struct DeferedKey {
+struct DeferredKey {
     millis: i64,
     data: usize,
 }
-impl DeferedKey {
+impl DeferredKey {
     fn get_key(&self) -> i64 {
         return self.millis;
     }
 }
 
 // push the last element to a min heap. sift up
-fn min_heap_push(v: &mut [DeferedKey]) {
+fn min_heap_push(v: &mut [DeferredKey]) {
     let mut k = v.len() - 1; // last element
     let mut parent = (k - 1) / 2;
     while k > 0 && v[k].get_key() < v[parent].get_key() {
@@ -103,7 +209,7 @@ fn min_heap_push(v: &mut [DeferedKey]) {
     }
 }
 // pop the first element to end. sift down.
-fn min_heap_pop(v: &mut [DeferedKey]) {
+fn min_heap_pop(v: &mut [DeferredKey]) {
     let mut k = 0;
     let value = v[0];
     while k < v.len() - 1 {
@@ -198,7 +304,7 @@ impl<UserCommand> ReactorMgr<UserCommand> {
             socket_handlers: FlatStorage::new(),
             poller: Poller::new().unwrap(),
             count_streams: 0,
-            cmd_sender: cmd_sender,
+            cmd_sender: CmdSender { 0: cmd_sender },
             cmd_recv: cmd_recv,
         }
     }
@@ -365,107 +471,51 @@ impl<UserCommand> ReactRuntime<UserCommand> {
     pub fn new() -> Self {
         Self {
             mgr: ReactorMgr::new(),
-            defered_data: FlatStorage::new(),
-            defered_heap: Vec::new(),
-            events: Events::new(),
+            deferred_data: FlatStorage::new(),
+            deferred_heap: Vec::new(),
+            sock_events: Events::new(),
         }
     }
-    /// This function should be periodically called to process socket messages and commands.
-    /// @return true if the runtime has reactor or command;
+    /// This function should be periodically called to process socket messages, commands and deferred commands.
+    /// @return true if the runtime has any of reactors, commands or deferred commands;
     ///     false when there's no reactor/socket or command, then this runtime could be destroyed.
     ///     But cloned senders may still send cmd before destruction. User must handle this race condition.
     pub fn process_events(&mut self) -> bool {
         let has_events = self.process_sock_events();
-        let defereds = self.process_defered_queue();
+        let deferreds = self.process_deferred_queue();
         let cmds = self.process_command_queue();
         return has_events
-            || defereds > 0
+            || deferreds > 0
             || cmds > 0
-            || self.defered_heap.len() > 0
-            || self.len() > 0;
-        // TODO or there are defered commands.
+            || self.deferred_heap.len() > 0
+            || self.mgr.len() > 0;
     }
 
-    /// \return all socks (listener & stream)
-    pub fn len(&self) -> usize {
-        self.mgr.len()
-    }
     pub fn count_streams(&self) -> usize {
         self.mgr.count_streams
+    }
+    /// Count listeners, Reactors
+    pub fn count_reactors(&self) -> usize {
+        self.mgr.len()
+    }
+    pub fn count_deferred_commands(&self) -> usize {
+        self.deferred_data.len()
     }
     pub fn get_cmd_sender(&self) -> &CmdSender<UserCommand> {
         &self.mgr.cmd_sender
     }
-    pub fn send_connect<AReactor: Reactor<UserCommand = UserCommand> + 'static>(
-        &self,
-        remote_addr: &str,
-        reactor: AReactor,
-        deferred: Deferred,
-        completion: impl FnOnce(CommandCompletion) + 'static,
-    ) -> bool {
-        return self.send_cmd(
-            INVALID_REACTOR_ID,
-            SysCommand::NewConnect(remote_addr.to_owned(), Box::new(reactor)),
-            deferred,
-            completion,
-        );
-    }
-    pub fn send_listen<AReactor: TcpListenerHandler<UserCommand = UserCommand> + 'static>(
-        &self,
-        local_addr: &str,
-        reactor: AReactor,
-        deferred: Deferred,
-        completion: impl FnOnce(CommandCompletion) + 'static,
-    ) -> bool {
-        return self.send_cmd(
-            INVALID_REACTOR_ID,
-            SysCommand::NewListen(local_addr.to_owned(), Box::new(reactor)),
-            deferred,
-            completion,
-        );
-    }
-    pub fn send_close(
-        self,
-        reactorid: ReactorID,
-        deferred: Deferred,
-        completion: impl FnOnce(CommandCompletion) + 'static,
-    ) -> bool {
-        return self.send_cmd(reactorid, SysCommand::CloseSocket, deferred, completion);
-    }
-    pub fn send_user_cmd(
-        self,
-        reactorid: ReactorID,
-        cmd: UserCommand,
-        deferred: Deferred,
-        completion: impl FnOnce(CommandCompletion) + 'static,
-    ) -> bool {
-        return self.send_cmd(reactorid, SysCommand::UserCmd(cmd), deferred, completion);
-    }
 
     //----------------------------- private -----------------------------------------------
 
-    fn send_cmd(
-        &self,
-        reactorid: ReactorID,
-        cmd: SysCommand<UserCommand>,
-        deferred: Deferred,
-        completion: impl FnOnce(CommandCompletion) + 'static,
-    ) -> bool {
-        return self
-            .mgr
-            .cmd_sender
-            .send_cmd(reactorid, cmd, deferred, completion);
-    }
-
     /// return true to indicate some events has been processed.
     fn process_sock_events(&mut self) -> bool {
-        self.events.clear();
+        self.sock_events.clear();
         self.mgr
             .poller
-            .wait(&mut self.events, Some(Duration::from_secs(0)))
+            .wait(&mut self.sock_events, Some(Duration::from_secs(0)))
             .unwrap(); // None duration means forever
 
-        for ev in self.events.iter() {
+        for ev in self.sock_events.iter() {
             let mut removesock = false;
             let current_reactorid = ReactorID::from_usize(ev.key);
             let mut new_connection_to_add = None;
@@ -590,13 +640,15 @@ impl<UserCommand> ReactRuntime<UserCommand> {
             }
         }
 
-        return !self.events.is_empty();
+        return !self.sock_events.is_empty();
     }
 
     /// @return number of command procesed
     fn process_command_queue(&mut self) -> usize {
         let mut count_cmd = 0usize;
-        loop {
+        // max number of commands to process for each call of process_command_queue. So to have chances to process socket/deferred events.
+        const MAX_CMD_BATCH: usize = 32usize;
+        for _ in 0..MAX_CMD_BATCH {
             let cmddata: CmdData<UserCommand> = match self.mgr.cmd_recv.try_recv() {
                 Err(err) => {
                     if err == std::sync::mpsc::TryRecvError::Empty {
@@ -616,24 +668,24 @@ impl<UserCommand> ReactRuntime<UserCommand> {
                         .duration_since(std::time::SystemTime::UNIX_EPOCH)
                         .unwrap()
                         .as_millis() as i64;
-                    if !ReactRuntime::<UserCommand>::is_defered_current(millis) {
+                    if !ReactRuntime::<UserCommand>::is_deferred_current(millis) {
                         // if beyond half millis tolerance
-                        let key = self.defered_data.add(cmddata);
-                        self.defered_heap.push(DeferedKey {
+                        let key = self.deferred_data.add(cmddata);
+                        self.deferred_heap.push(DeferredKey {
                             millis: millis,
                             data: key,
                         });
-                        min_heap_push(&mut self.defered_heap);
+                        min_heap_push(&mut self.deferred_heap);
                         continue; // continue loop recv
                     }
                 }
             }
-            // TODO: to avoid recursive executing immiediate cmd, save all commands and call execute_immediate_cmd.
             self.execute_immediate_cmd(cmddata);
         } // loop
+        return count_cmd;
     }
 
-    fn is_defered_current(millis: i64) -> bool {
+    fn is_deferred_current(millis: i64) -> bool {
         let now_nanos = utils::now_nanos();
         return millis * 1000000 + 5 * 100000 <= now_nanos;
     }
@@ -717,17 +769,17 @@ impl<UserCommand> ReactRuntime<UserCommand> {
         } // match cmd
     }
 
-    fn process_defered_queue(&mut self) -> usize {
-        while self.defered_heap.len() > 0
-            && ReactRuntime::<UserCommand>::is_defered_current(self.defered_heap[0].millis)
+    fn process_deferred_queue(&mut self) -> usize {
+        while self.deferred_heap.len() > 0
+            && ReactRuntime::<UserCommand>::is_deferred_current(self.deferred_heap[0].millis)
         {
-            let key = self.defered_heap[0].data;
-            min_heap_pop(&mut self.defered_heap);
-            self.defered_heap.pop();
-            if let Some(cmddata) = self.defered_data.remove(key) {
+            let key = self.deferred_heap[0].data;
+            min_heap_pop(&mut self.deferred_heap);
+            self.deferred_heap.pop();
+            if let Some(cmddata) = self.deferred_data.remove(key) {
                 self.execute_immediate_cmd(cmddata);
             } else {
-                panic!("No defered CommandData with key: {}", key);
+                panic!("No deferred CommandData with key: {}", key);
             }
         }
         return 0;
@@ -738,7 +790,7 @@ impl<UserCommand> ReactRuntime<UserCommand> {
 //            SysCommand to Reactor
 //====================================================================================
 
-pub enum SysCommand<UserCommand> {
+enum SysCommand<UserCommand> {
     //-- system commands are processed by Runtime, Reactor will not receive them.
     NewConnect(String, Box<dyn Reactor<UserCommand = UserCommand>>), // connect to remote IP:Port
     NewListen(
@@ -749,67 +801,13 @@ pub enum SysCommand<UserCommand> {
     UserCmd(UserCommand),
 }
 
-pub enum Deferred {
-    Immediate,
-    UtilTime(std::time::SystemTime),
-}
-pub enum CommandCompletion {
-    Completed(ReactorID),
-    Error(String),
-}
-
-pub struct CmdData<UserCommand> {
+struct CmdData<UserCommand> {
     reactorid: ReactorID,
     cmd: SysCommand<UserCommand>,
     deferred: Deferred,
     completion: Box<dyn FnOnce(CommandCompletion)>,
 }
 unsafe impl<UserCommand> Send for CmdData<UserCommand> {}
-
-trait ReactorCmdSender<UserCommand> {
-    fn send_cmd(
-        &self,
-        reactorid: ReactorID,
-        cmd: SysCommand<UserCommand>,
-        deferred: Deferred,
-        completion: impl FnOnce(CommandCompletion) + 'static,
-    ) -> bool;
-}
-
-impl<UserCommand> ReactorCmdSender<UserCommand> for CmdSender<UserCommand> {
-    fn send_cmd(
-        &self,
-        reactorid: ReactorID,
-        cmd: SysCommand<UserCommand>,
-        deferred: Deferred,
-        completion: impl FnOnce(CommandCompletion) + 'static,
-    ) -> bool {
-        // check NewConnect/NewListen when reactor == INVALID.
-        match &cmd {
-            SysCommand::NewListen(_, _) | SysCommand::NewConnect(_, _) => {
-                if reactorid != INVALID_REACTOR_ID {
-                    logmsg!("reactorid msut be INVALID_REACTOR_ID if NewConnect/NewListen");
-                    return false;
-                }
-            }
-            SysCommand::UserCmd(_) => {
-                if reactorid == INVALID_REACTOR_ID {
-                    logmsg!("UserCmd must has a valid reactorid.");
-                    return false;
-                }
-            }
-            _ => {}
-        }
-        self.send(CmdData::<UserCommand> {
-            reactorid: reactorid,
-            cmd: cmd,
-            deferred: deferred,
-            completion: Box::new(completion),
-        })
-        .unwrap();
-        return true;
-    }
-}
 
 //====================================================================================
 //            MsgSender
@@ -1376,12 +1374,14 @@ pub mod example {
                 dbglog!("client sent initial msg");
             } else {
                 // if it's not client. close parent listener socket.
-                ctx.cmd_sender.send_cmd(
-                    self.dispatcher.parent_listener,
-                    SysCommand::CloseSocket,
-                    Deferred::Immediate,
-                    |_res| {},
-                );
+                ctx.cmd_sender
+                    .send_cmd(
+                        self.dispatcher.parent_listener,
+                        SysCommand::CloseSocket,
+                        Deferred::Immediate,
+                        |_res| {},
+                    )
+                    .unwrap();
 
                 logmsg!("server sock: {:?} connected.", ctx.sock);
             }
@@ -1423,19 +1423,24 @@ mod test {
     pub fn test_reactors_cmd() {
         let addr = "127.0.0.1:12355";
         let mut runtime = ReactRuntime::new();
-        runtime.send_listen(
-            addr,
-            DefaultTcpListenerHandler::<example::MyReactor>::new(),
-            Deferred::Immediate,
-            |_| {},
-        );
-        runtime.send_connect(
-            addr,
-            example::MyReactor::new_client(2, 1000),
-            Deferred::Immediate,
-            |_| {},
-        );
+        let cmd_sender = runtime.get_cmd_sender();
+        cmd_sender
+            .send_listen(
+                addr,
+                DefaultTcpListenerHandler::<example::MyReactor>::new(),
+                Deferred::Immediate,
+                |_| {},
+            )
+            .unwrap();
+        cmd_sender
+            .send_connect(
+                addr,
+                example::MyReactor::new_client(2, 1000),
+                Deferred::Immediate,
+                |_| {},
+            )
+            .unwrap();
         while runtime.process_events() {}
-        assert_eq!(runtime.len(), 0);
+        assert_eq!(runtime.count_reactors(), 0);
     }
 }
