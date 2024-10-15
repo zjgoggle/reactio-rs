@@ -1,8 +1,12 @@
-use std::sync::{atomic, atomic::AtomicBool, Arc, Mutex};
 use crate::{logmsg, CmdSender, ReactRuntime, ReactorID};
+use std::sync::{
+    atomic::{self, AtomicBool, AtomicI32},
+    Arc, Mutex,
+};
 
-/// Threaded reactors are stored in a ThreadedReactorMgr. Each thread has a ReactRuntime. Each Reactor is managed/owned by a ReactRuntime.
-/// There is also a map<ReactorName, ReactorID>. So that we can find the ReactorID with unique ReactorName and send command to Reactor with ReactorID.
+/// Threaded reactors are stored in a `ThreadedReactorMgr`. Each thread has a `ReactRuntime`. And each `Reactor` is owned by a `ReactRuntime`.
+/// There is also a map<ReactorName, ReactorID>, which is used to find the ReactorID with unique ReactorName and send command to Reactor with ReactorID.
+/// * **Note that each reactor must add itsef into reactor_uid_map by add_reactor_uid when on_connected and deregister itself by add_reactor_uid when on_close/on_drop.**
 pub struct ThreadedReactorMgr<UserCommand: 'static> {
     senders: Vec<CmdSender<UserCommand>>,
     threads: Vec<std::thread::JoinHandle<()>>,
@@ -38,34 +42,44 @@ impl<UserCommand: 'static> ThreadedReactorMgr<UserCommand> {
             stopcmd: Arc::new(AtomicBool::new(false)),
             reactor_uid_map: Mutex::new(GlobalReactorUIDMap::new()),
         };
+
+        // let mut runtimes : Vec<Arc<Mutex<ReactRuntime<UserCommand>>>> = Vec::new(); // ReactRuntime cannot be accessed across threads.
+        // runtimes.resize_with(size, || Arc::new(Mutex::new(ReactRuntime::new())));
+        let uninited_senders: Vec<Arc<Mutex<Option<CmdSender<UserCommand>>>>> =
+            vec![Arc::new(Mutex::new(None)); size]; // threads set each slot.
+        let count_inited_threads = Arc::new(AtomicI32::new(0));
         let startcmd = Arc::new(AtomicBool::new(false));
-        let (tx_orig, rx) = std::sync::mpsc::channel::<IDAndSender<UserCommand>>(); // send <idx, CmdSender> from each thread.
+
         for i in 0..size {
-            let (stopcmd, waitstart, tx) = (
-                Arc::clone(&me.stopcmd),
-                Arc::clone(&startcmd),
-                tx_orig.clone(),
-            );
+            let (stopcmd, startcmd) = (Arc::clone(&me.stopcmd), Arc::clone(&startcmd));
+            let uninited_sender = Arc::clone(&uninited_senders[i]);
+            let count_inited_threads = Arc::clone(&count_inited_threads);
+            // let pruntime = Arc::clone(&runtimes[i]);
+
             let thread = std::thread::Builder::new()
                 .name(format!("ThreadedReactors-{}", i))
                 .spawn(move || {
                     let threadid = i;
-                    // create runtime
+                    logmsg!("Entered ThreadedReactors-{}", threadid);
+                    // let mut guard_runtime = pruntime.lock().unwrap();
+                    // let ref mut runtime = *guard_runtime;
                     let mut runtime = ReactRuntime::<UserCommand>::new();
-                    tx.send(IDAndSender {
-                        0: threadid,
-                        1: runtime.get_cmd_sender().clone(),
-                    })
-                    .expect("Failed to send cmd_sender to main thread.");
-
-                    while waitstart.load(atomic::Ordering::Relaxed) != true {
-                        std::thread::yield_now();
+                    {
+                        let mut sender_guard = uninited_sender.lock().unwrap();
+                        *sender_guard = Some(runtime.get_cmd_sender().clone())
                     }
-                    //-- elements of vec senders are created. Now set each cmd_sender.
-                    logmsg!("Started ThreadedReactors-{}", threadid);
+                    drop(uninited_sender);
+
+                    count_inited_threads.fetch_add(1, atomic::Ordering::Relaxed);
+                    drop(count_inited_threads);
+
+                    while startcmd.load(atomic::Ordering::Relaxed) != true {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                    drop(startcmd);
+                    logmsg!("Start polling events in ThreadedReactors-{}", threadid);
                     while !stopcmd.load(atomic::Ordering::Relaxed) {
                         runtime.process_events();
-                        std::thread::sleep(std::time::Duration::from_millis(1));
                         std::thread::yield_now();
                     }
                     logmsg!("Exiting ThreadedReactors-{}", threadid);
@@ -74,21 +88,19 @@ impl<UserCommand: 'static> ThreadedReactorMgr<UserCommand> {
             me.threads.push(thread);
         }
 
-        let mut senders = Vec::<IDAndSender<UserCommand>>::new();
-        while senders.len() < size {
-            match rx.recv_timeout(std::time::Duration::from_millis(10)) {
-                Ok(idsender) => {
-                    senders.push(idsender);
-                }
-                _ => {
-                    panic!("Failed to recv CmdSender from thread!");
+        logmsg!("Waiting for thread initializations");
+        while count_inited_threads.load(atomic::Ordering::Relaxed) < size as i32 {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        logmsg!("Recved all thread initializations");
+        {
+            for (i, sender) in uninited_senders.iter().enumerate() {
+                let guard = sender.lock().unwrap();
+                match &*guard {
+                    Some(s) => me.senders.push(s.clone()),
+                    _ => panic!("Thread-{} didn't set CmdSender", i),
                 }
             }
-        }
-        senders.sort_by(|a, b| a.0.cmp(&b.0));
-        for (i, idsender) in senders.into_iter().enumerate() {
-            debug_assert_eq!(i, idsender.0);
-            me.senders.push(idsender.1);
         }
         startcmd.store(true, atomic::Ordering::Relaxed);
         return Arc::new(me);
@@ -116,20 +128,15 @@ impl<UserCommand: 'static> ThreadedReactorMgr<UserCommand> {
             _ => None,
         }
     }
-    /// return None if the value is added; otherwise, value will not be added and return old value.
-    pub fn add_reactor_uid(&self, key: ReactorName, value: ReactorUID) -> Option<ReactorUID> {
+    // return error when key was already in the map.
+    pub fn add_reactor_uid(&self, key: ReactorName, value: ReactorUID) -> Result<(), ()> {
         let mut mapguard = self.reactor_uid_map.lock().unwrap();
-        return mapguard.insert(key, value);
-    }
-
-    /// If there was old value update it and return old value; otherwise, return None.
-    pub fn update_reactor_uid(&self, key: &str, value: ReactorUID) -> Option<ReactorUID> {
-        let mut mapguard = self.reactor_uid_map.lock().unwrap();
-        match mapguard.get_mut(key) {
-            Some(oldval) => Some(std::mem::replace(oldval, value)),
-            _ => None,
+        match mapguard.insert(key, value) {
+            Some(_) => Err(()),
+            _ => Ok(())
         }
     }
+
     pub fn remove_reactor_name(&self, key: &str) -> Option<ReactorUID> {
         let mut mapguard = self.reactor_uid_map.lock().unwrap();
         return mapguard.remove(key);
@@ -215,22 +222,22 @@ pub mod example {
         fn on_connected(
             &mut self,
             ctx: &mut crate::ReactorContext<Self::UserCommand>,
-            _listener: crate::ReactorID,
+            listener: crate::ReactorID,
         ) -> bool {
+            self.reactor.dispatcher.parent_listener = listener;
             logmsg!(
                 "[{}] connected sock: {:?}",
                 self.reactor.dispatcher.name,
                 ctx.sock
             );
             // register <name, uid>
-            let res = self.reactormgr.add_reactor_uid(
+            self.reactormgr.add_reactor_uid(
                 self.reactor.dispatcher.name.clone(),
                 super::ReactorUID {
                     runtimeid: self.runtimeid,
                     reactorid: ctx.reactorid,
                 },
-            );
-            assert!(res.is_none());
+            ).expect("Duplicate reactor name");
             if self.reactor.dispatcher.is_client {
                 // send cmd to self to start sending msg to server.
                 ctx.cmd_sender
@@ -247,6 +254,9 @@ pub mod example {
                     .expect("Failed too send user cmd!");
             } else {
                 // server
+                ctx.cmd_sender
+                    .send_close(listener, Deferred::Immediate, |_| {})
+                    .unwrap();
             }
             return true;
             // return self.reactor.on_connected(ctx, listener);
@@ -262,7 +272,7 @@ pub mod example {
             ctx: &mut crate::ReactorContext<Self::UserCommand>,
         ) {
             logmsg!(
-                "[{}] ***Recv user cmd*** {}",
+                "[{}] **Recv user cmd** {}",
                 &self.reactor.dispatcher.name,
                 &cmd
             );
@@ -316,7 +326,7 @@ mod test {
     pub fn test_threaded_reactors() {
         let addr = "127.0.0.1:12355";
         let stopcounter = Arc::new(AtomicI32::new(0));
-        let mgr = ThreadedReactorMgr::<String>::new(2);
+        let mgr = ThreadedReactorMgr::<String>::new(2); // 2 threads
         let (threadid0, threadid1) = (0, 1);
         mgr.get_sender(threadid0)
             .unwrap()

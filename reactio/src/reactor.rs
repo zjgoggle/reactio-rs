@@ -1,7 +1,6 @@
 use crate::dbglog;
-// import one macro per line. macros are exported at root of crate instead of mod level.
 use crate::flat_storage::FlatStorage;
-use crate::logmsg;
+use crate::logmsg; // import one macro per line. macros are exported at root of crate instead of mod level.
 use crate::utils;
 use core::panic;
 use polling::{Event, Events, PollMode, Poller};
@@ -14,43 +13,54 @@ use std::{marker::PhantomData, net::TcpStream};
 //            Reactor, Poller
 //====================================================================================
 
-/// A Reactor is assigned a unique ReactorID by ReactRuntime, and is able to receive socket messsages (via reader) and commands.
+/// A `Reactor` is assigned a unique ReactorID when adding to a ReactRuntime, and is able to receive socket messsages (via reader) and commands.
+/// `process_events` of a ReactRuntime instance should be periodically called in a dedicated thread.
 /// Besides socket communication, Sending command is the only thread-safe way to communicate with a Reactor.
-/// A Reactor could send socket messages (via sender), and send commands (via cmd_sender) to another Reactor with specific ReactorID.
+/// A Reactor could send socket messages (via sender), or send commands (via cmd_sender) to another Reactor with specific ReactorID.
+/// A Reactor is destroyed when the socket is closed.
 pub trait Reactor {
     type UserCommand;
 
-    /// called when connection is established.
-    /// @param listener the listener ID when the reactor is created by a listener socket; otherwise, it's INVALID_REACTOR_ID.
-    /// @return true accept the connection; false to close the connection.
+    /// Called when connection is established.
+    /// * `ctx`  - The context the used for reactor to send/read socket message, or send command.
+    ///   * **Note that ctx.cmd_sener can only send command to a reactor that belongs to the same ReactRuntime.**
+    /// * `listener` - The listener ID when the reactor is created by a listener socket; otherwise, it's INVALID_REACTOR_ID.
+    /// * return true to accept the connection; false to close the connection.
     fn on_connected(
         &mut self,
         ctx: &mut ReactorContext<Self::UserCommand>,
         listener: ReactorID,
     ) -> bool;
 
-    /// \return false to close socket.
+    /// Called when there's a readable event. `ctx.reader` could be used to read message. See `MsgReader` for usage.
+    /// * return false to close socket.
     fn on_readable(&mut self, ctx: &mut ReactorContext<Self::UserCommand>) -> bool;
 
+    /// Called when receiving a command.
     fn on_command(&mut self, cmd: Self::UserCommand, ctx: &mut ReactorContext<Self::UserCommand>);
 
-    /// called when the reactor is removed from poller and before closing the socket.
+    /// Called when the reactor is removed from poller and before closing the socket.
     /// The Reactor will be destroyed after this call.
     fn on_close(&mut self, _cmd_sender: &CmdSender<Self::UserCommand>) {}
 }
 
+/// `Deferred` is used to indicate a command to be executed immidately or in a deferred time.
 pub enum Deferred {
     Immediate,
     UtilTime(std::time::SystemTime),
 }
+/// `CommandCompletion` is used as an argument of command completion callback.
 pub enum CommandCompletion {
+    /// Command execution is completed.
     Completed(ReactorID),
+    /// Command was not executed due to error.
     Error(String),
 }
 
-/// CmdSender is owned by a ReactorRuntime. Users send commands to a reactor with speficic ReactorID.
+/// CmdSender is owned by a ReactRuntime. Users send commands to a reactor with specific ReactorID.
+/// * **Note that CmdSender can only send command to a reactor that belongs to the same ReactRuntime.**
 pub struct CmdSender<UserCommand>(std::sync::mpsc::Sender<CmdData<UserCommand>>);
-
+/// `CmdSender` is a `Send` so that is can be passed through threads.
 unsafe impl<UserCommand> Send for CmdSender<UserCommand> {}
 
 impl<UserCommand> Clone for CmdSender<UserCommand> {
@@ -60,6 +70,11 @@ impl<UserCommand> Clone for CmdSender<UserCommand> {
 }
 impl<UserCommand> CmdSender<UserCommand> {
     /// Send a command to create a socket to connect to remote IP:Port. The reactor will receive socket messages once connected.
+    /// # Arguments
+    /// * `remote_addr` -  Remote address in format IP:Port.
+    /// * `reactor`     -  The reactor to be add to ReactRuntime to handle the socket messages.
+    /// * `deferred`    -  Indicate the command to be executed immediately or in a deferred time.
+    /// * `completion`  -  Callback to indicate if the command has been executed or failed (e.g. reactorid doesn't exist).
     pub fn send_connect<AReactor: Reactor<UserCommand = UserCommand> + 'static>(
         &self,
         remote_addr: &str,
@@ -100,6 +115,10 @@ impl<UserCommand> CmdSender<UserCommand> {
         return self.send_cmd(reactorid, SysCommand::CloseSocket, deferred, completion);
     }
 
+    /// Send a UserCommand to a reactor with specified `reactorid`.
+    /// The existance of reactorid is not check in this function.
+    /// When `process_events` is called and the deferred time becomes current,
+    /// `reactorid` is checked before passing the cmd to reactor.
     pub fn send_user_cmd(
         &self,
         reactorid: ReactorID,
@@ -149,13 +168,16 @@ impl<UserCommand> CmdSender<UserCommand> {
     }
 }
 
+/// `ReactorContext` is a helper for a reactor to send/recv socket message, or send command.
 pub struct ReactorContext<'a, UserCommand> {
-    pub reactorid: ReactorID,
-    pub sock: &'a mut std::net::TcpStream,
-    pub sender: &'a mut MsgSender, // sock_sender
-    pub reader: &'a mut MsgReader, // sock_reader
-    pub cmd_sender: &'a CmdSender<UserCommand>,
+    pub reactorid: ReactorID,                   // current reactorid.
+    pub sock: &'a mut std::net::TcpStream,      // associated socket.
+    pub sender: &'a mut MsgSender,              // helper to send socket message.
+    pub reader: &'a mut MsgReader,              // helper to read socket message.
+    pub cmd_sender: &'a CmdSender<UserCommand>, // helper to send command.
 }
+/// `TcpListenerHandler` handles incoming connections on a listening socket.
+/// Similar to `Reactor`, it's destroyed when listening socket is closed.
 pub trait TcpListenerHandler {
     type UserCommand;
 
@@ -173,16 +195,14 @@ pub trait TcpListenerHandler {
     fn on_close(&mut self, _cmd_sender: &CmdSender<Self::UserCommand>) {}
 }
 
-/// ReactRuntime manages Reactors which receive socket data or command.
+/// ReactRuntime manages & owns Reactors which receive/send socket data or command.
 /// A ReactRuntime has a command queue, deferred command queue and a collection of reactors.
 /// Each reactor is assigned a ReactorID when adding to ReactRuntime. Users send command to a reactor
-/// with a specific ReactorID that belongs to the ReactRuntime. If it's INVALID_REACTOR_ID,
-/// The command will not be passed to a reactor. The command could be immediate or deferred for a time.
-/// A example is that, on close of a reactor, it could send a command to the ReactRuntime to reconnect.
+/// with a specific ReactorID that belongs to the ReactRuntime. The command could be immediate or deferred for a time.
+/// E.g, on close of a reactor, it could send a command to the ReactRuntime to reconnect in future.
 ///
 /// Communication between ReactRuntimes are via sending command also, which is the only thread-safe way.
-/// Note that a ReactRuntime can only exist in a thread. Accessing a ReactRuntime from multiple thread is not supported.
-/// Also multiple ReactRuntime in a thread is feasible, but is not needed.
+/// * **Note that `process_events` of a ReactRuntime instance should be periodically called in a dedicated thread.**
 pub struct ReactRuntime<UserCommand> {
     mgr: ReactorMgr<UserCommand>,
     deferred_data: FlatStorage<CmdData<UserCommand>>,
@@ -254,7 +274,7 @@ enum TcpSocketHandler<UserCommand> {
     ), // <sock, handler, key_in_flat_storage>
     StreamType(SockData, Box<dyn Reactor<UserCommand = UserCommand>>),
 }
-pub struct SockData {
+struct SockData {
     pub reactorid: ReactorID,
     pub sock: std::net::TcpStream,
     pub sender: MsgSender,
@@ -395,7 +415,7 @@ impl<UserCommand> ReactorMgr<UserCommand> {
     }
 
     /// Close & remove socket/reactor.
-    /// @return true if key exists ; false when key doesn't exist or it's in process of polling.
+    /// * return true if key exists; false when key doesn't exist or it's in process of polling.
     fn close_reactor(&mut self, reactorid: ReactorID) -> bool {
         if let Some(sockhandler) = self.socket_handlers.remove(reactorid.sockslot as usize) {
             match sockhandler {
@@ -423,7 +443,7 @@ impl<UserCommand> ReactorMgr<UserCommand> {
         return false;
     }
 
-    /// \local_addr  ip:port. e.g. "127.0.0.1:8000"
+    /// * local_addr - ip:port. e.g. "127.0.0.1:8000"
     fn start_listen(
         &mut self,
         local_addr: &str,
@@ -482,10 +502,9 @@ impl<UserCommand> ReactRuntime<UserCommand> {
             sock_events: Events::new(),
         }
     }
-    /// This function should be periodically called to process socket messages, commands and deferred commands.
-    /// @return true if the runtime has any of reactors, commands or deferred commands;
-    ///     false when there's no reactor/socket or command, then this runtime could be destroyed.
-    ///     But cloned senders may still send cmd before destruction. User must handle this race condition.
+    /// `process_events` should be periodically called to process socket messages, commands and deferred commands.
+    /// - return true if the runtime has any of reactors, commands or deferred commands;
+    /// - return false when there's no reactor/socket or command, then this runtime could be destroyed.
     pub fn process_events(&mut self) -> bool {
         let has_events = self.process_sock_events();
         let deferreds = self.process_deferred_queue();
@@ -496,7 +515,7 @@ impl<UserCommand> ReactRuntime<UserCommand> {
             || self.deferred_heap.len() > 0
             || self.mgr.len() > 0;
     }
-
+    /// return number of streams (non-listener reactors)
     pub fn count_streams(&self) -> usize {
         self.mgr.count_streams
     }
@@ -504,9 +523,11 @@ impl<UserCommand> ReactRuntime<UserCommand> {
     pub fn count_reactors(&self) -> usize {
         self.mgr.len()
     }
+    /// return number if deferred commands in deferred queue (not command queue)
     pub fn count_deferred_commands(&self) -> usize {
         self.deferred_data.len()
     }
+    /// Get the `CmdSender` managed by this ReactRuntime. It's used to send command to reactors in this ReactRuntime.
     pub fn get_cmd_sender(&self) -> &CmdSender<UserCommand> {
         &self.mgr.cmd_sender
     }
@@ -649,7 +670,7 @@ impl<UserCommand> ReactRuntime<UserCommand> {
         return !self.sock_events.is_empty();
     }
 
-    /// @return number of command procesed
+    /// return number of command procesed
     fn process_command_queue(&mut self) -> usize {
         let mut count_cmd = 0usize;
         // max number of commands to process for each call of process_command_queue. So to have chances to process socket/deferred events.
@@ -819,9 +840,12 @@ unsafe impl<UserCommand> Send for CmdData<UserCommand> {}
 //            MsgSender
 //====================================================================================
 
-/// MsgSender is a per-socket object try sending msg on a non-blocking socket. if it fails due to WOULDBLOCK,
+/// MsgSender is a per-socket object. It tries sending msg on a non-blocking socket. if sending fails due to WOULDBLOCK,
 /// the unsent bytes are saved and register a Write insterest in poller, so that
 /// the remaining data will be scheduled to send on next Writeable event.
+///
+/// If a reactor should choose either MsgSender or socket to send messages.
+/// Mixed using of both may cause out-of-order messages.
 pub struct MsgSender {
     pub buf: Vec<u8>,
     pub pending: FlatStorage<PendingSend>,
@@ -830,7 +854,7 @@ pub struct MsgSender {
     pub bytes_sent: usize,   // total bytes having been sent. buf[0] is bytes_sent+1 byte to send.
     close_or_error: bool,
 }
-
+/// Used to save the pending Send action.
 pub struct PendingSend {
     next_id: usize,  // the id in flat_storage
     startpos: usize, // the first byte of message to sent in buf,
@@ -838,11 +862,15 @@ pub struct PendingSend {
     completion: Box<dyn FnOnce()>, // notify write completion.
 }
 
+/// `SendOrQueResult` is the result of `MsgSender::send_or_que`.
 #[derive(PartialEq, Eq)]
 pub enum SendOrQueResult {
-    Complete,     // No message in queue
-    InQueue,      // message in queue
-    CloseOrError, // close socket.
+    /// No message in queue
+    Complete,
+    /// message in queue
+    InQueue,
+    /// close socket.
+    CloseOrError,
 }
 impl MsgSender {
     pub fn new() -> Self {
@@ -855,6 +883,9 @@ impl MsgSender {
             close_or_error: false,
         }
     }
+    /// Send the message or queue it if unabe to send. When there's any messsage is in queue, The `ReactRuntime` will auto send it next time when `process_events`` is called.
+    /// * Note that if this function is called with a socket. the same sender should always be used to send socket messages.
+    /// * `send_completion` - callback to indicate the message is sent. If there's any error, the socket will be closed and this callback is not called.
     pub fn send_or_que(
         &mut self,
         sock: &mut std::net::TcpStream,
@@ -909,7 +940,7 @@ impl MsgSender {
         return SendOrQueResult::InQueue;
     }
 
-    pub fn queue_msg(&mut self, buf: &[u8], send_completion: impl Fn() + 'static) {
+    fn queue_msg(&mut self, buf: &[u8], send_completion: impl Fn() + 'static) {
         let prev_id = self.last_pending_id;
         self.last_pending_id = self.pending.add(PendingSend {
             next_id: usize::MAX,
@@ -927,8 +958,9 @@ impl MsgSender {
         self.buf.extend_from_slice(buf);
     }
 
+    // This function is called ony ReactRuntime to send messages in queue.
     #[allow(unused_assignments)]
-    pub fn send_queued(&mut self, sock: &mut std::net::TcpStream) -> SendOrQueResult {
+    fn send_queued(&mut self, sock: &mut std::net::TcpStream) -> SendOrQueResult {
         if self.buf.is_empty() {
             return SendOrQueResult::Complete;
         }
@@ -1012,11 +1044,12 @@ impl MsgSender {
 //            MsgReader
 //====================================================================================
 
+/// Dispatch msg that has been read by MsgReader.
 pub trait MsgDispatcher<UserCommand> {
-    /// dispatch msg.
-    /// @param msg_size  the decoded message size which is return value of previous call of dispatch. 0 means message having not been decoded.
-    /// @return ExpectMsgSize(msgsize) to indicate more read until full msgsize is read then call next dispatch. msgsize==0 means msg size is unknown.
+    /// * `msg_size` -  the decoded message size which is return value of previous call of dispatch. 0 means message having not been decoded.
+    /// * return ExpectMsgSize(msgsize) to indicate more read until full msgsize is read then call next dispatch. msgsize==0 means msg size is unknown.
     ///         DropMsgSize(msgsize) to indiciate message is processed already. framework can drop the message after call. then msgsize will be 0 again.
+    /// * Note that when calling dispatch(msg_size) -> ExpectMsgSize(expect_msg_size), when expect_msg_size !=0, it should be always > msg_size.  
     fn dispatch(
         &mut self,
         buf: &mut [u8],
@@ -1025,20 +1058,26 @@ pub trait MsgDispatcher<UserCommand> {
     ) -> DispatchResult;
 }
 
+/// `DispatchContext` helper for MsgDispatcher.
 pub struct DispatchContext<'a, UserCommand> {
     pub sock: &'a mut std::net::TcpStream,
     pub sender: &'a mut MsgSender, // socker sender
     pub cmd_sender: &'a CmdSender<UserCommand>,
 }
 
+/// `DispatchResult` is returned by `dispatch` to indicate result.
 pub enum DispatchResult {
-    Error,                // Error. Exit reading message.
-    ExpectMsgSize(usize), // expecting more read, indicating expected size, dispatcher will not be called until specified msg bytes are read. size==0 means unknown size.
-    DropMsgSize(usize),   // msg has been dispatched, indicating bytes to drop.
+    /// Error. Exit reading message and close socket.
+    Error,
+    /// Expecting more read, indicating expected size, dispatcher will not be called until specified msg bytes are read. size==0 means unknown size.
+    /// * Note that when calling dispatch(msg_size) -> ExpectMsgSize(expect_msg_size), when expect_msg_size !=0, it should be always > msg_size.  
+    ExpectMsgSize(usize),
+    /// msg has been dispatched, indicating bytes to drop.
+    DropMsgSize(usize),
 }
 
-/// Framework should repeatedly call MsgReader::try_read() to read messages from a sock into a recv_buffer and calls dispatcher to dispatch message.
-///
+/// `MsgReader` is a per-socket helper to read socket messages.
+/// On Readable event, call MsgReader::try_read() to read messages from a sock into a recv_buffer and calls dispatcher to dispatch message.
 pub struct MsgReader {
     recv_buffer: Vec<u8>,
     min_reserve: usize,
@@ -1064,12 +1103,8 @@ impl MsgReader {
         }
     }
 
-    /// On each new read, call callback dispatcher: (buffer, msg_size, sock) -> DispatchResult
-    /// @param msg_size  the decoded message size which is return value of previous call of dispatch. 0 means message having not been decoded.
-    /// @return ExpectMsgSize(msgsize) to indicate more read until full msgsize is read then call next dispatch. msgsize==0 means msg size is unknown.
-    ///         DropMsgSize(msgsize) to indiciate message is processed already. framework can drop the message after call. then msgsize will be 0 again.
-    ///
-    fn try_read<UserCommand>(
+    /// On each readable eveent, call this function to read socket message into recv_buffer and dispatches messsage.
+    pub fn try_read<UserCommand>(
         &mut self,
         ctx: &mut DispatchContext<UserCommand>,
         dispatcher: &mut impl MsgDispatcher<UserCommand>,
@@ -1160,8 +1195,9 @@ impl MsgReader {
 //         Default TcpListenerHandler
 //====================================================================================
 
-/// OnServiceReactor is used to create a new reactor when accept a new socket.
+/// OnServiceReactor is used by TcpListenerHandler to create a new reactor when accept a new socket.
 pub trait NewServiceReactor: Reactor {
+    /// The parameter to create NewServiceReactor
     type InitServiceParam: Clone;
     fn new_service_reactor(param: Self::InitServiceParam) -> Self;
 }
@@ -1207,7 +1243,7 @@ impl<NewReactor: NewServiceReactor + 'static> TcpListenerHandler
     }
 }
 //====================================================================================
-//            MyReactor
+//            example: MyReactor
 //====================================================================================
 
 pub mod example {
@@ -1354,6 +1390,7 @@ pub mod example {
             Self::new(name, true, max_echo, latency_batch)
         }
 
+        /// Used to send initial message.
         pub fn send_msg(&mut self, ctx: &mut ReactorContext<MyUserCommand>, msg: &str) -> bool {
             let mut buf = vec![0u8; msg.len() + MSG_HEADER_SIZE];
 
@@ -1366,13 +1403,11 @@ pub mod example {
             let res =
                 ctx.sender
                     .send_or_que(&mut ctx.sock, &buf[..(msg.len() + MSG_HEADER_SIZE)], || {});
-            if res == SendOrQueResult::CloseOrError {
-                return false;
-            }
-            return true;
+            return res != SendOrQueResult::CloseOrError;
         }
     }
 
+    /// The parameter used to create a socket when listener socket accepts a connection.
     #[derive(Debug, Clone)]
     pub struct ServiceParam {
         pub name: String,
@@ -1385,7 +1420,7 @@ pub mod example {
         }
     }
     impl Reactor for MyReactor {
-        type UserCommand = MyUserCommand; // mut
+        type UserCommand = MyUserCommand;
 
         fn on_connected(
             &mut self,
@@ -1393,30 +1428,14 @@ pub mod example {
             listener: ReactorID,
         ) -> bool {
             self.dispatcher.parent_listener = listener;
+            logmsg!("[{}] sock connected: {:?}", self.dispatcher.name, ctx.sock);
             if self.dispatcher.is_client {
-                logmsg!(
-                    "[{}] client sock connected: {:?}",
-                    self.dispatcher.name,
-                    ctx.sock
-                );
                 self.send_msg(ctx, "test msg000");
-                dbglog!("client sent initial msg");
             } else {
                 // if it's not client. close parent listener socket.
                 ctx.cmd_sender
-                    .send_cmd(
-                        self.dispatcher.parent_listener,
-                        SysCommand::CloseSocket,
-                        Deferred::Immediate,
-                        |_res| {},
-                    )
+                    .send_close(listener, Deferred::Immediate, |_| {})
                     .unwrap();
-
-                logmsg!(
-                    "[{}] server sock connected: {:?} ",
-                    self.dispatcher.name,
-                    ctx.sock
-                );
             }
             return true;
         }

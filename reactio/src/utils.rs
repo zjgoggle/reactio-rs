@@ -141,6 +141,6 @@ mod test {
     pub fn test_reactio() {
         let mut _buf = [0u8; 32];
         dbglog!("test dbglog.");
-        // logmsg!("any msg");
+        logmsg!("any msg");
     }
 }
