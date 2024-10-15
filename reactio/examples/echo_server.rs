@@ -7,7 +7,10 @@ fn run(port: i32) {
     cmd_sender
         .send_listen(
             &addr,
-            DefaultTcpListenerHandler::<example::MyReactor>::new(),
+            DefaultTcpListenerHandler::<example::MyReactor>::new(example::ServiceParam {
+                name: "server".to_owned(),
+                latency_batch: 1000,
+            }),
             reactio::Deferred::Immediate,
             |result| match result {
                 reactio::CommandCompletion::Error(err) => {

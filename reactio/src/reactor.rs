@@ -50,6 +50,9 @@ pub enum CommandCompletion {
 
 /// CmdSender is owned by a ReactorRuntime. Users send commands to a reactor with speficic ReactorID.
 pub struct CmdSender<UserCommand>(std::sync::mpsc::Sender<CmdData<UserCommand>>);
+
+unsafe impl<UserCommand> Send for CmdSender<UserCommand> {}
+
 impl<UserCommand> Clone for CmdSender<UserCommand> {
     fn clone(&self) -> Self {
         Self { 0: self.0.clone() }
@@ -201,6 +204,9 @@ impl DeferredKey {
 // push the last element to a min heap. sift up
 fn min_heap_push(v: &mut [DeferredKey]) {
     let mut k = v.len() - 1; // last element
+    if k == 0 {
+        return;
+    }
     let mut parent = (k - 1) / 2;
     while k > 0 && v[k].get_key() < v[parent].get_key() {
         v.swap(k, parent);
@@ -829,7 +835,7 @@ pub struct PendingSend {
     next_id: usize,  // the id in flat_storage
     startpos: usize, // the first byte of message to sent in buf,
     msgsize: usize,
-    completion: Box<dyn Fn()>, // notify write completion.
+    completion: Box<dyn FnOnce()>, // notify write completion.
 }
 
 #[derive(PartialEq, Eq)]
@@ -1153,30 +1159,34 @@ impl MsgReader {
 //====================================================================================
 //         Default TcpListenerHandler
 //====================================================================================
-pub struct DefaultTcpListenerHandler<StreamHandler> {
+
+/// OnServiceReactor is used to create a new reactor when accept a new socket.
+pub trait NewServiceReactor: Reactor {
+    type InitServiceParam: Clone;
+    fn new_service_reactor(param: Self::InitServiceParam) -> Self;
+}
+pub struct DefaultTcpListenerHandler<NewReactor: NewServiceReactor + 'static> {
     pub reactorid: ReactorID,
-    _phantom: PhantomData<StreamHandler>,
+    service_param: <NewReactor as NewServiceReactor>::InitServiceParam,
+    _phantom: PhantomData<NewReactor>,
 }
 
-impl<StreamHandler: Reactor + Default + 'static> DefaultTcpListenerHandler<StreamHandler> {
-    pub fn new() -> Self {
-        Self::default()
-    }
-}
-impl<StreamHandler: Reactor + Default + 'static> Default
-    for DefaultTcpListenerHandler<StreamHandler>
-{
-    fn default() -> Self {
+//---------------------- !NewServiceReactor ----------------
+
+impl<NewReactor: NewServiceReactor + 'static> DefaultTcpListenerHandler<NewReactor> {
+    pub fn new(param: <NewReactor as NewServiceReactor>::InitServiceParam) -> Self {
         Self {
             reactorid: INVALID_REACTOR_ID,
+            service_param: param,
             _phantom: PhantomData::default(),
         }
     }
 }
-impl<StreamHandler: Reactor + Default + 'static> TcpListenerHandler
-    for DefaultTcpListenerHandler<StreamHandler>
+
+impl<NewReactor: NewServiceReactor + 'static> TcpListenerHandler
+    for DefaultTcpListenerHandler<NewReactor>
 {
-    type UserCommand = <StreamHandler as Reactor>::UserCommand;
+    type UserCommand = <NewReactor as Reactor>::UserCommand;
 
     fn on_start_listen(
         &mut self,
@@ -1191,10 +1201,11 @@ impl<StreamHandler: Reactor + Default + 'static> TcpListenerHandler
         _new_conn: &mut std::net::TcpStream,
         _addr: std::net::SocketAddr,
     ) -> Option<Box<dyn Reactor<UserCommand = Self::UserCommand>>> {
-        Some(Box::new(StreamHandler::default()))
+        Some(Box::new(NewReactor::new_service_reactor(
+            self.service_param.clone(),
+        )))
     }
 }
-
 //====================================================================================
 //            MyReactor
 //====================================================================================
@@ -1213,14 +1224,15 @@ pub mod example {
     pub type MyUserCommand = String;
 
     pub struct MyReactor {
-        dispatcher: EchoAndLatency, // reader & dispacther must be decoupled, in order to avoid double mutable reference of self.
+        pub dispatcher: EchoAndLatency, // reader & dispacther must be decoupled, in order to avoid double mutable reference of self.
     }
 
     /// EchoAndLatency reports latency and echo back.
     /// It's owned by MyReactor, which also owns a MsgReader that calls EchoAndLatency::dispatch.
     /// MsgReader & MsgDispatcher must be decoupled.
     /// See issue: https://stackoverflow.com/questions/79015535/could-anybody-optimize-class-design-and-fix-issue-mutable-more-than-once-at-a-t
-    struct EchoAndLatency {
+    pub struct EchoAndLatency {
+        pub name: String,
         pub parent_listener: ReactorID,
         pub is_client: bool, // default false
         pub max_echo: i32,
@@ -1317,13 +1329,14 @@ pub mod example {
 
     impl Default for MyReactor {
         fn default() -> Self {
-            MyReactor::new(false, i32::MAX, LATENCY_BATCH_SIZE)
+            MyReactor::new("".to_owned(), false, i32::MAX, LATENCY_BATCH_SIZE)
         }
     }
     impl MyReactor {
-        pub fn new(isclient: bool, a_max_echo: i32, a_latency_batch: i32) -> Self {
+        pub fn new(name: String, isclient: bool, a_max_echo: i32, a_latency_batch: i32) -> Self {
             Self {
                 dispatcher: EchoAndLatency {
+                    name: name,
                     parent_listener: INVALID_REACTOR_ID,
                     is_client: isclient,
                     max_echo: a_max_echo,
@@ -1337,11 +1350,40 @@ pub mod example {
             }
         }
 
-        pub fn new_client(max_echo: i32, latency_batch: i32) -> Self {
-            Self::new(true, max_echo, latency_batch)
+        pub fn new_client(name: String, max_echo: i32, latency_batch: i32) -> Self {
+            Self::new(name, true, max_echo, latency_batch)
+        }
+
+        pub fn send_msg(&mut self, ctx: &mut ReactorContext<MyUserCommand>, msg: &str) -> bool {
+            let mut buf = vec![0u8; msg.len() + MSG_HEADER_SIZE];
+
+            buf[MSG_HEADER_SIZE..(MSG_HEADER_SIZE + msg.len())].copy_from_slice(msg.as_bytes());
+            let header: &mut MsgHeader = utils::bytes_to_ref_mut(&mut buf[0..10]);
+            header.body_len = msg.len() as u16;
+            header.send_time = utils::cpu_now_nanos();
+
+            //
+            let res =
+                ctx.sender
+                    .send_or_que(&mut ctx.sock, &buf[..(msg.len() + MSG_HEADER_SIZE)], || {});
+            if res == SendOrQueResult::CloseOrError {
+                return false;
+            }
+            return true;
         }
     }
 
+    #[derive(Debug, Clone)]
+    pub struct ServiceParam {
+        pub name: String,
+        pub latency_batch: i32,
+    }
+    impl NewServiceReactor for MyReactor {
+        type InitServiceParam = ServiceParam;
+        fn new_service_reactor(p: Self::InitServiceParam) -> Self {
+            MyReactor::new((p.name + "-1").to_owned(), false, i32::MAX, p.latency_batch)
+        }
+    }
     impl Reactor for MyReactor {
         type UserCommand = MyUserCommand; // mut
 
@@ -1352,25 +1394,12 @@ pub mod example {
         ) -> bool {
             self.dispatcher.parent_listener = listener;
             if self.dispatcher.is_client {
-                logmsg!("client sock: {:?} connected.", ctx.sock);
-                let msg_content = b"test msg00";
-                let mut buf = vec![0u8; msg_content.len() + MSG_HEADER_SIZE];
-
-                buf[MSG_HEADER_SIZE..(MSG_HEADER_SIZE + msg_content.len())]
-                    .copy_from_slice(&msg_content[..]);
-                let header: &mut MsgHeader = utils::bytes_to_ref_mut(&mut buf[0..10]);
-                header.body_len = msg_content.len() as u16;
-                header.send_time = utils::cpu_now_nanos();
-
-                //
-                let res = ctx.sender.send_or_que(
-                    &mut ctx.sock,
-                    &buf[..(msg_content.len() + MSG_HEADER_SIZE)],
-                    || {},
+                logmsg!(
+                    "[{}] client sock connected: {:?}",
+                    self.dispatcher.name,
+                    ctx.sock
                 );
-                if res == SendOrQueResult::CloseOrError {
-                    return false;
-                }
+                self.send_msg(ctx, "test msg000");
                 dbglog!("client sent initial msg");
             } else {
                 // if it's not client. close parent listener socket.
@@ -1383,7 +1412,11 @@ pub mod example {
                     )
                     .unwrap();
 
-                logmsg!("server sock: {:?} connected.", ctx.sock);
+                logmsg!(
+                    "[{}] server sock connected: {:?} ",
+                    self.dispatcher.name,
+                    ctx.sock
+                );
             }
             return true;
         }
@@ -1417,6 +1450,8 @@ pub mod example {
 
 #[cfg(test)]
 mod test {
+    use example::ServiceParam;
+
     use super::*;
 
     #[test]
@@ -1427,7 +1462,10 @@ mod test {
         cmd_sender
             .send_listen(
                 addr,
-                DefaultTcpListenerHandler::<example::MyReactor>::new(),
+                DefaultTcpListenerHandler::<example::MyReactor>::new(ServiceParam {
+                    name: "server".to_owned(),
+                    latency_batch: 1000,
+                }),
                 Deferred::Immediate,
                 |_| {},
             )
@@ -1435,7 +1473,7 @@ mod test {
         cmd_sender
             .send_connect(
                 addr,
-                example::MyReactor::new_client(2, 1000),
+                example::MyReactor::new_client("client".to_owned(), 2, 1000),
                 Deferred::Immediate,
                 |_| {},
             )

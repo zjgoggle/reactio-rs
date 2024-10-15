@@ -110,6 +110,7 @@ macro_rules! logmsg {
         let mut buf = [0u8; 40];
         print!("[{}] ", crate::utils::format_time(&mut buf, crate::utils::now_nanos(), 6, false));
         println!( $( $args ),* );
+        // std::io::stdout().flush().unwrap();
     }
 }
 
@@ -121,6 +122,7 @@ macro_rules! dbglog {
         let mut buf = [0u8; 40];
         print!("[{}] [DBG] ", crate::utils::format_time(&mut buf, crate::utils::now_nanos(), 6, false));
         println!( $( $args ),* );
+        // std::io::stdout().flush().unwrap();
     }
 }
 #[allow(unused_macros)]

@@ -7,7 +7,7 @@ fn run(port: i32, max_echos: i32, latency_batch: i32) {
     cmd_sender
         .send_connect(
             &addr,
-            example::MyReactor::new_client(max_echos, latency_batch),
+            example::MyReactor::new_client("client".to_owned(), max_echos, latency_batch),
             reactio::Deferred::Immediate,
             |result| match result {
                 reactio::CommandCompletion::Error(err) => {
