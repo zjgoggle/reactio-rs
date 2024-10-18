@@ -21,27 +21,81 @@ use std::{marker::PhantomData, net::TcpStream};
 pub trait Reactor {
     type UserCommand;
 
-    /// Called when connection is established.
-    /// * `ctx`  - The context the used for reactor to send/read socket message, or send command.
+    /// ReactRuntime calls it when connection is established.
+    /// * `ctx`  - The context the used for reactor to send socket message or command.
     ///   * **Note that ctx.cmd_sener can only send command to a reactor that belongs to the same ReactRuntime.**
     /// * `listener` - The listener ID when the reactor is created by a listener socket; otherwise, it's INVALID_REACTOR_ID.
     /// * return true to accept the connection; false to close the connection.
     fn on_connected(
         &mut self,
-        ctx: &mut ReactorContext<Self::UserCommand>,
+        ctx: &mut DispatchContext<Self::UserCommand>,
         listener: ReactorID,
     ) -> bool;
 
-    /// Called when there's a readable event. `ctx.reader` could be used to read message. See `MsgReader` for usage.
+    /// It's called by in on_readable() when either decoded_msg_size==0 (meaning message size is unknown) or decoded_msg_size <= buf.len() (meaning a full message is read).
+    ///
+    /// * `decoded_msg_size` -  the decoded message size which is return value of previous call of on_inbound_message. 0 means message having not been decoded.
+    /// * return ExpectMsgSize(msgsize) to indicate more read until full msgsize is read then call next dispatch. msgsize==0 indicates msg size is unknown.
+    ///         DropMsgSize(msgsize) to indiciate message is processed already. framework can drop the message after call. then msgsize will be 0 again.
+    /// * **Note that when calling on_inbound_message(decoded_msg_size) -> ExpectMsgSize(expect_msg_size), if expect_msg_size!=0, it should be always > msg_size.**
+    fn on_inbound_message(
+        &mut self,
+        buf: &mut [u8],
+        decoded_msg_size: usize,
+        ctx: &mut DispatchContext<Self::UserCommand>,
+    ) -> MessageResult;
+
+    /// ReactRuntime calls it when there's a readable event. `ctx.reader` could be used to read message. See `MsgReader` for usage.
+    /// This is a default implementation which uses MsgReader to read messages and calls on_inbound_message when a full message is read.
     /// * return false to close socket.
-    fn on_readable(&mut self, ctx: &mut ReactorContext<Self::UserCommand>) -> bool;
+    fn on_readable(&mut self, ctx: &mut ReactorReableContext<Self::UserCommand>) -> bool {
+        return ctx.reader.try_read(
+            &mut DispatchContext {
+                reactorid: ctx.reactorid,
+                sock: &mut ctx.sock,
+                sender: &mut ctx.sender,
+                cmd_sender: &ctx.cmd_sender,
+            },
+            self,
+        );
+    }
 
-    /// Called when receiving a command.
-    fn on_command(&mut self, cmd: Self::UserCommand, ctx: &mut ReactorContext<Self::UserCommand>);
+    /// ReactRuntime calls it when receiving a command.
+    fn on_command(&mut self, cmd: Self::UserCommand, ctx: &mut DispatchContext<Self::UserCommand>);
 
-    /// Called when the reactor is removed from poller and before closing the socket.
+    /// ReactRuntime calls it when the reactor is removed from poller and before closing the socket.
     /// The Reactor will be destroyed after this call.
     fn on_close(&mut self, _cmd_sender: &CmdSender<Self::UserCommand>) {}
+}
+
+/// `DispatchContext` contains all info that could be used to dispatch command/message to reactors.
+pub struct DispatchContext<'a, UserCommand> {
+    pub reactorid: ReactorID,
+    pub sock: &'a mut std::net::TcpStream,
+    pub sender: &'a mut MsgSender, // socker sender
+    pub cmd_sender: &'a CmdSender<UserCommand>,
+}
+impl<'a, UserCommand> DispatchContext<'a, UserCommand> {
+    fn from(data: &'a mut SockData, cmd_sender: &'a CmdSender<UserCommand>) -> Self {
+        Self {
+            reactorid: data.reactorid,
+            sock: &mut data.sock,
+            sender: &mut data.sender,
+            cmd_sender: cmd_sender,
+        }
+    }
+}
+
+/// `MessageResult` is returned by `on_inbound_message` to indicate result.
+pub enum MessageResult {
+    /// Error or close. Exit message reading and close socket.
+    Close,
+    /// Expecting more read, indicating decoded/expected message size. If it's non-zero, `on_inbound_message`` will not be called until full message is read;
+    ///     if it's 0, meaning the message size is unknown, `on_inbound_message` will be called everytime when there are any bytes read.
+    /// * **Note that when calling on_inbound_message(decoded_msg_size) -> ExpectMsgSize(expect_msg_size), if expect_msg_size!=0, it should be always > msg_size.**
+    ExpectMsgSize(usize),
+    /// msg has been processed, indicating bytes to drop.
+    DropMsgSize(usize),
 }
 
 /// `Deferred` is used to indicate a command to be executed immidately or in a deferred time.
@@ -168,8 +222,8 @@ impl<UserCommand> CmdSender<UserCommand> {
     }
 }
 
-/// `ReactorContext` is a helper for a reactor to send/recv socket message, or send command.
-pub struct ReactorContext<'a, UserCommand> {
+/// `ReactorReableContext` is a helper for a reactor to send/recv socket message, or send command.
+pub struct ReactorReableContext<'a, UserCommand> {
     pub reactorid: ReactorID,                   // current reactorid.
     pub sock: &'a mut std::net::TcpStream,      // associated socket.
     pub sender: &'a mut MsgSender,              // helper to send socket message.
@@ -281,7 +335,7 @@ struct SockData {
     pub reader: MsgReader,
     interested_writable: bool,
 }
-impl<'a, UserCommand> ReactorContext<'a, UserCommand> {
+impl<'a, UserCommand> ReactorReableContext<'a, UserCommand> {
     fn from(data: &'a mut SockData, cmd_sender: &'a CmdSender<UserCommand>) -> Self {
         Self {
             reactorid: data.reactorid,
@@ -477,7 +531,7 @@ impl<UserCommand> ReactorMgr<UserCommand> {
             .unwrap()
         {
             if handler.on_connected(
-                &mut ReactorContext::from(sockdata, &self.cmd_sender),
+                &mut DispatchContext::from(sockdata, &self.cmd_sender),
                 INVALID_REACTOR_ID,
             ) {
                 return Result::Ok(reactorid);
@@ -585,8 +639,10 @@ impl<UserCommand> ReactRuntime<UserCommand> {
                             }
                         }
                         if ev.readable {
-                            removesock = !handler
-                                .on_readable(&mut ReactorContext::from(ctx, &self.mgr.cmd_sender));
+                            removesock = !handler.on_readable(&mut ReactorReableContext::from(
+                                ctx,
+                                &self.mgr.cmd_sender,
+                            ));
                         }
                         if ctx.sender.close_or_error {
                             removesock = true;
@@ -632,7 +688,7 @@ impl<UserCommand> ReactRuntime<UserCommand> {
                             .unwrap()
                     {
                         if newhandler.on_connected(
-                            &mut ReactorContext::from(newsockdata, &self.mgr.cmd_sender),
+                            &mut DispatchContext::from(newsockdata, &self.mgr.cmd_sender),
                             current_reactorid,
                         ) {
                             INVALID_REACTOR_ID // accept it, don't close it.
@@ -777,7 +833,12 @@ impl<UserCommand> ReactRuntime<UserCommand> {
                                 } else {
                                     (reactor).on_command(
                                         usercmd,
-                                        &mut ReactorContext::from(ctx, &self.mgr.cmd_sender),
+                                        &mut DispatchContext {
+                                            reactorid: cmddata.reactorid,
+                                            sock: &mut ctx.sock,
+                                            sender: &mut ctx.sender,
+                                            cmd_sender: &self.mgr.cmd_sender,
+                                        },
                                     );
                                     (cmddata.completion)(CommandCompletion::Completed(
                                         cmddata.reactorid,
@@ -1044,46 +1105,14 @@ impl MsgSender {
 //            MsgReader
 //====================================================================================
 
-/// Dispatch msg that has been read by MsgReader.
-pub trait MsgDispatcher<UserCommand> {
-    /// * `msg_size` -  the decoded message size which is return value of previous call of dispatch. 0 means message having not been decoded.
-    /// * return ExpectMsgSize(msgsize) to indicate more read until full msgsize is read then call next dispatch. msgsize==0 means msg size is unknown.
-    ///         DropMsgSize(msgsize) to indiciate message is processed already. framework can drop the message after call. then msgsize will be 0 again.
-    /// * Note that when calling dispatch(msg_size) -> ExpectMsgSize(expect_msg_size), when expect_msg_size !=0, it should be always > msg_size.  
-    fn dispatch(
-        &mut self,
-        buf: &mut [u8],
-        msg_size: usize,
-        ctx: &mut DispatchContext<UserCommand>,
-    ) -> DispatchResult;
-}
-
-/// `DispatchContext` helper for MsgDispatcher.
-pub struct DispatchContext<'a, UserCommand> {
-    pub sock: &'a mut std::net::TcpStream,
-    pub sender: &'a mut MsgSender, // socker sender
-    pub cmd_sender: &'a CmdSender<UserCommand>,
-}
-
-/// `DispatchResult` is returned by `dispatch` to indicate result.
-pub enum DispatchResult {
-    /// Error. Exit reading message and close socket.
-    Error,
-    /// Expecting more read, indicating expected size, dispatcher will not be called until specified msg bytes are read. size==0 means unknown size.
-    /// * Note that when calling dispatch(msg_size) -> ExpectMsgSize(expect_msg_size), when expect_msg_size !=0, it should be always > msg_size.  
-    ExpectMsgSize(usize),
-    /// msg has been dispatched, indicating bytes to drop.
-    DropMsgSize(usize),
-}
-
-/// `MsgReader` is a per-socket helper to read socket messages.
-/// On Readable event, call MsgReader::try_read() to read messages from a sock into a recv_buffer and calls dispatcher to dispatch message.
+/// `MsgReader` is a per-socket helper to read socket messages. It auto handles partial/multiple messages in recv buffer.  
+/// On Readable event, call MsgReader::try_read() to read messages from a sock into a recv_buffer and calls dispatcher::on_inbound_message to dispatch message.
 pub struct MsgReader {
     recv_buffer: Vec<u8>,
     min_reserve: usize,
     startpos: usize,        // msg start position or first effective byte.
     bufsize: usize,         // count from buffer[0] to last read byte.
-    decoded_msgsize: usize, // decoded msg size from DispatchResult::ExpectMsgSize,
+    decoded_msgsize: usize, // decoded msg size from MessageResult::ExpectMsgSize,
 }
 
 impl Default for MsgReader {
@@ -1103,11 +1132,11 @@ impl MsgReader {
         }
     }
 
-    /// On each readable eveent, call this function to read socket message into recv_buffer and dispatches messsage.
+    /// On each readable event, call this function to read socket message into recv_buffer and dispatches messsage.
     pub fn try_read<UserCommand>(
         &mut self,
         ctx: &mut DispatchContext<UserCommand>,
-        dispatcher: &mut impl MsgDispatcher<UserCommand>,
+        dispatcher: &mut (impl Reactor<UserCommand = UserCommand> + ?Sized),
     ) -> bool {
         loop {
             debug_assert!(
@@ -1131,27 +1160,30 @@ impl MsgReader {
                         && (self.decoded_msgsize == 0
                             || self.startpos + self.decoded_msgsize <= self.bufsize)
                     {
-                        match dispatcher.dispatch(
+                        match dispatcher.on_inbound_message(
                             &mut self.recv_buffer[self.startpos..self.bufsize],
                             self.decoded_msgsize,
                             ctx,
                         ) {
-                            DispatchResult::ExpectMsgSize(msgsize) => {
-                                assert!(
-                                    msgsize == 0 || msgsize > self.bufsize - self.startpos,
-                                    "{msgsize:?} startpos:{} bufsize: {}",
-                                    self.startpos,
-                                    self.bufsize
-                                ); // either unknown msg size, or partial msg.
+                            MessageResult::ExpectMsgSize(msgsize) => {
+                                if !(msgsize == 0 || msgsize > self.bufsize - self.startpos) {
+                                    logmsg!( "[WARN] on_inbound_message should NOT expect a msgsize while full message is already received, which may cause recursive call. msgsize:{msgsize:?} startpos:{} endpos: {}",
+                                        self.startpos,
+                                        self.bufsize);
+                                    debug_assert!(
+                                        false,
+                                        "on_inbound_message expects an already full message."
+                                    );
+                                }
                                 self.decoded_msgsize = msgsize; // could be 0 if msg size is unknown.
                             }
-                            DispatchResult::DropMsgSize(msgsize) => {
+                            MessageResult::DropMsgSize(msgsize) => {
                                 assert!(msgsize > 0 && msgsize <= self.bufsize - self.startpos); // drop size should not exceed buffer size.
                                 self.startpos += msgsize;
                                 self.decoded_msgsize = 0;
                             }
-                            DispatchResult::Error => {
-                                logmsg!("[WARN] Dispatch error closing sock: {:?}. ", ctx.sock);
+                            MessageResult::Close => {
+                                logmsg!("Dispatch requested closing sock: {:?}. ", ctx.sock);
                                 return false;
                             }
                         }
@@ -1195,31 +1227,31 @@ impl MsgReader {
 //         Default TcpListenerHandler
 //====================================================================================
 
-/// OnServiceReactor is used by TcpListenerHandler to create a new reactor when accept a new socket.
-pub trait NewServiceReactor: Reactor {
-    /// The parameter to create NewServiceReactor
-    type InitServiceParam: Clone;
-    fn new_service_reactor(param: Self::InitServiceParam) -> Self;
+/// NewServerReactor is used by TcpListenerHandler to create a new reactor when accept a new socket.
+pub trait NewServerReactor: Reactor {
+    /// The parameter to create NewServerReactor
+    type InitServerParam: Clone;
+    fn new_server_reactor(param: Self::InitServerParam) -> Self;
 }
-pub struct DefaultTcpListenerHandler<NewReactor: NewServiceReactor + 'static> {
+pub struct DefaultTcpListenerHandler<NewReactor: NewServerReactor + 'static> {
     pub reactorid: ReactorID,
-    service_param: <NewReactor as NewServiceReactor>::InitServiceParam,
+    server_param: <NewReactor as NewServerReactor>::InitServerParam,
     _phantom: PhantomData<NewReactor>,
 }
 
-//---------------------- !NewServiceReactor ----------------
+//---------------------- !NewServerReactor ----------------
 
-impl<NewReactor: NewServiceReactor + 'static> DefaultTcpListenerHandler<NewReactor> {
-    pub fn new(param: <NewReactor as NewServiceReactor>::InitServiceParam) -> Self {
+impl<NewReactor: NewServerReactor + 'static> DefaultTcpListenerHandler<NewReactor> {
+    pub fn new(param: <NewReactor as NewServerReactor>::InitServerParam) -> Self {
         Self {
             reactorid: INVALID_REACTOR_ID,
-            service_param: param,
+            server_param: param,
             _phantom: PhantomData::default(),
         }
     }
 }
 
-impl<NewReactor: NewServiceReactor + 'static> TcpListenerHandler
+impl<NewReactor: NewServerReactor + 'static> TcpListenerHandler
     for DefaultTcpListenerHandler<NewReactor>
 {
     type UserCommand = <NewReactor as Reactor>::UserCommand;
@@ -1237,8 +1269,8 @@ impl<NewReactor: NewServiceReactor + 'static> TcpListenerHandler
         _new_conn: &mut std::net::TcpStream,
         _addr: std::net::SocketAddr,
     ) -> Option<Box<dyn Reactor<UserCommand = Self::UserCommand>>> {
-        Some(Box::new(NewReactor::new_service_reactor(
-            self.service_param.clone(),
+        Some(Box::new(NewReactor::new_server_reactor(
+            self.server_param.clone(),
         )))
     }
 }
@@ -1259,15 +1291,9 @@ pub mod example {
 
     pub type MyUserCommand = String;
 
+    /// MyReactor, working as either client or server, echos back string messages and exit when reaching `max_echo`.
+    /// It also calculates & print round-trip latencies for every latency_batch number of echos.
     pub struct MyReactor {
-        pub dispatcher: EchoAndLatency, // reader & dispacther must be decoupled, in order to avoid double mutable reference of self.
-    }
-
-    /// EchoAndLatency reports latency and echo back.
-    /// It's owned by MyReactor, which also owns a MsgReader that calls EchoAndLatency::dispatch.
-    /// MsgReader & MsgDispatcher must be decoupled.
-    /// See issue: https://stackoverflow.com/questions/79015535/could-anybody-optimize-class-design-and-fix-issue-mutable-more-than-once-at-a-t
-    pub struct EchoAndLatency {
         pub name: String,
         pub parent_listener: ReactorID,
         pub is_client: bool, // default false
@@ -1279,24 +1305,53 @@ pub mod example {
         pub single_trip_durations: Vec<i64>,
         pub round_trip_durations: Vec<i64>,
     }
-    impl MsgDispatcher<MyUserCommand> for EchoAndLatency {
-        fn dispatch(
+    impl Default for MyReactor {
+        fn default() -> Self {
+            MyReactor::new("".to_owned(), false, i32::MAX, LATENCY_BATCH_SIZE)
+        }
+    }
+    impl Reactor for MyReactor {
+        type UserCommand = MyUserCommand;
+
+        fn on_command(&mut self, cmd: MyUserCommand, ctx: &mut DispatchContext<MyUserCommand>) {
+            logmsg!("Reactorid {} recv cmd: {}", ctx.reactorid, cmd);
+        }
+
+        fn on_connected(
+            &mut self,
+            ctx: &mut DispatchContext<MyUserCommand>,
+            listener: ReactorID,
+        ) -> bool {
+            self.parent_listener = listener;
+            logmsg!("[{}] sock connected: {:?}", self.name, ctx.sock);
+            if self.is_client {
+                self.send_msg(ctx, "test msg000");
+            } else {
+                // if it's not client. close parent listener socket.
+                ctx.cmd_sender
+                    .send_close(listener, Deferred::Immediate, |_| {})
+                    .unwrap();
+            }
+            return true;
+        }
+
+        fn on_inbound_message(
             &mut self,
             buf: &mut [u8],
-            msg_size: usize,
-            ctx: &mut DispatchContext<MyUserCommand>,
-        ) -> DispatchResult {
-            let mut msg_size = msg_size;
+            decoded_msg_size: usize,
+            ctx: &mut DispatchContext<Self::UserCommand>,
+        ) -> MessageResult {
+            let mut msg_size = decoded_msg_size;
             if msg_size == 0 {
                 // decode header
                 if buf.len() < MSG_HEADER_SIZE {
-                    return DispatchResult::ExpectMsgSize(0); // partial header
+                    return MessageResult::ExpectMsgSize(0); // partial header
                 }
                 let header: &MsgHeader = utils::bytes_to_ref(&buf[0..MSG_HEADER_SIZE]);
                 msg_size = header.body_len as usize + MSG_HEADER_SIZE;
 
                 if msg_size > buf.len() {
-                    return DispatchResult::ExpectMsgSize(msg_size); // decoded msg_size but still partial msg. need reading more.
+                    return MessageResult::ExpectMsgSize(msg_size); // decoded msg_size but still partial msg. need reading more.
                 } // else having read full msg. should NOT return. continue processing.
             }
             debug_assert!(buf.len() >= msg_size); // full msg.
@@ -1333,15 +1388,17 @@ pub mod example {
                 if SendOrQueResult::CloseOrError
                     == ctx.sender.send_or_que(ctx.sock, &buf[..msg_size], || {})
                 {
-                    return DispatchResult::Error;
+                    return MessageResult::Close;
                 }
 
                 self.count_echo += 1;
+                return MessageResult::DropMsgSize(msg_size);
+            } else {
+                return MessageResult::Close;
             }
-            return DispatchResult::DropMsgSize(msg_size);
         }
     }
-    impl EchoAndLatency {
+    impl MyReactor {
         fn report_latencies(&mut self) {
             let fact = 1000;
             self.round_trip_durations.sort();
@@ -1361,28 +1418,19 @@ pub mod example {
             self.single_trip_durations.clear();
             self.round_trip_durations.clear();
         }
-    }
 
-    impl Default for MyReactor {
-        fn default() -> Self {
-            MyReactor::new("".to_owned(), false, i32::MAX, LATENCY_BATCH_SIZE)
-        }
-    }
-    impl MyReactor {
         pub fn new(name: String, isclient: bool, a_max_echo: i32, a_latency_batch: i32) -> Self {
             Self {
-                dispatcher: EchoAndLatency {
-                    name: name,
-                    parent_listener: INVALID_REACTOR_ID,
-                    is_client: isclient,
-                    max_echo: a_max_echo,
-                    count_echo: 0,
-                    latency_batch: a_latency_batch,
-                    //
-                    last_sent_time: 0,
-                    single_trip_durations: Vec::new(),
-                    round_trip_durations: Vec::new(),
-                },
+                name: name,
+                parent_listener: INVALID_REACTOR_ID,
+                is_client: isclient,
+                max_echo: a_max_echo,
+                count_echo: 0,
+                latency_batch: a_latency_batch,
+                //
+                last_sent_time: 0,
+                single_trip_durations: Vec::new(),
+                round_trip_durations: Vec::new(),
             }
         }
 
@@ -1391,7 +1439,7 @@ pub mod example {
         }
 
         /// Used to send initial message.
-        pub fn send_msg(&mut self, ctx: &mut ReactorContext<MyUserCommand>, msg: &str) -> bool {
+        pub fn send_msg(&mut self, ctx: &mut DispatchContext<MyUserCommand>, msg: &str) -> bool {
             let mut buf = vec![0u8; msg.len() + MSG_HEADER_SIZE];
 
             buf[MSG_HEADER_SIZE..(MSG_HEADER_SIZE + msg.len())].copy_from_slice(msg.as_bytes());
@@ -1409,69 +1457,22 @@ pub mod example {
 
     /// The parameter used to create a socket when listener socket accepts a connection.
     #[derive(Debug, Clone)]
-    pub struct ServiceParam {
+    pub struct ServerParam {
         pub name: String,
         pub latency_batch: i32,
     }
-    impl NewServiceReactor for MyReactor {
-        type InitServiceParam = ServiceParam;
-        fn new_service_reactor(p: Self::InitServiceParam) -> Self {
+    impl NewServerReactor for MyReactor {
+        type InitServerParam = ServerParam;
+        fn new_server_reactor(p: Self::InitServerParam) -> Self {
             MyReactor::new((p.name + "-1").to_owned(), false, i32::MAX, p.latency_batch)
-        }
-    }
-    impl Reactor for MyReactor {
-        type UserCommand = MyUserCommand;
-
-        fn on_connected(
-            &mut self,
-            ctx: &mut ReactorContext<MyUserCommand>,
-            listener: ReactorID,
-        ) -> bool {
-            self.dispatcher.parent_listener = listener;
-            logmsg!("[{}] sock connected: {:?}", self.dispatcher.name, ctx.sock);
-            if self.dispatcher.is_client {
-                self.send_msg(ctx, "test msg000");
-            } else {
-                // if it's not client. close parent listener socket.
-                ctx.cmd_sender
-                    .send_close(listener, Deferred::Immediate, |_| {})
-                    .unwrap();
-            }
-            return true;
-        }
-
-        fn on_readable(&mut self, ctx: &mut ReactorContext<MyUserCommand>) -> bool {
-            if !ctx.reader.try_read(
-                &mut DispatchContext {
-                    sock: &mut ctx.sock,
-                    sender: &mut ctx.sender,
-                    cmd_sender: &ctx.cmd_sender,
-                },
-                &mut self.dispatcher,
-            ) {
-                return false; // error: close
-            }
-            if self.dispatcher.count_echo >= self.dispatcher.max_echo {
-                logmsg!(
-                    "sock:{:?} reached max echo: {}. closing.",
-                    ctx.sock,
-                    self.dispatcher.max_echo
-                );
-                return false;
-            }
-            return true;
-        }
-        fn on_command(&mut self, cmd: MyUserCommand, ctx: &mut ReactorContext<MyUserCommand>) {
-            logmsg!("Reactorid {} recv cmd: {}", ctx.reactorid, cmd);
         }
     }
 }
 
 #[cfg(test)]
 mod test {
-    use example::ServiceParam;
-
     use super::*;
+    use example::ServerParam;
 
     #[test]
     pub fn test_reactors_cmd() {
@@ -1481,7 +1482,7 @@ mod test {
         cmd_sender
             .send_listen(
                 addr,
-                DefaultTcpListenerHandler::<example::MyReactor>::new(ServiceParam {
+                DefaultTcpListenerHandler::<example::MyReactor>::new(ServerParam {
                     name: "server".to_owned(),
                     latency_batch: 1000,
                 }),

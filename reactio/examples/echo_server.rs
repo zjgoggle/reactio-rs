@@ -7,7 +7,7 @@ fn run(port: i32) {
     cmd_sender
         .send_listen(
             &addr,
-            DefaultTcpListenerHandler::<example::MyReactor>::new(example::ServiceParam {
+            DefaultTcpListenerHandler::<example::MyReactor>::new(example::ServerParam {
                 name: "server".to_owned(),
                 latency_batch: 1000,
             }),

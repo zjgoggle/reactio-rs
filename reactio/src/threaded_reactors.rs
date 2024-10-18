@@ -133,7 +133,7 @@ impl<UserCommand: 'static> ThreadedReactorMgr<UserCommand> {
         let mut mapguard = self.reactor_uid_map.lock().unwrap();
         match mapguard.insert(key, value) {
             Some(_) => Err(()),
-            _ => Ok(())
+            _ => Ok(()),
         }
     }
 
@@ -154,7 +154,7 @@ impl<UserCommand: 'static> ThreadedReactorMgr<UserCommand> {
 pub mod example {
     use crate::threaded_reactors::ThreadedReactorMgr;
     use crate::{example::MyReactor, DefaultTcpListenerHandler, Deferred, Reactor};
-    use crate::{logmsg, NewServiceReactor};
+    use crate::{logmsg, NewServerReactor};
     use std::i32;
     use std::sync::atomic::{self, AtomicI32};
     use std::sync::Arc;
@@ -165,7 +165,7 @@ pub mod example {
         runtimeid: usize,
         reactormgr: Arc<ThreadedReactorMgr<<MyReactor as Reactor>::UserCommand>>,
         stopcounter: Arc<AtomicI32>,
-        reactor: MyReactor,
+        inner: MyReactor,
     }
     impl MyThreadedReactor {
         pub fn new_client(
@@ -180,39 +180,33 @@ pub mod example {
                 runtimeid: runtimeid,
                 reactormgr: mgr,
                 stopcounter: stopcounter,
-                reactor: MyReactor::new_client(name, max_echo, latency_batch),
+                inner: MyReactor::new_client(name, max_echo, latency_batch),
             }
         }
     }
     impl Drop for MyThreadedReactor {
         fn drop(&mut self) {
-            self.reactormgr
-                .remove_reactor_name(&self.reactor.dispatcher.name);
-            logmsg!("Dropping reactor: {}", self.reactor.dispatcher.name);
+            self.reactormgr.remove_reactor_name(&self.inner.name);
+            logmsg!("Dropping reactor: {}", self.inner.name);
             self.stopcounter.fetch_add(1, atomic::Ordering::Relaxed);
         }
     }
     #[derive(Clone)]
-    pub struct ThreadedServiceParam {
+    pub struct ThreadedServerParam {
         pub runtimeid: usize,
         pub reactormgr: Arc<ThreadedReactorMgr<<MyReactor as Reactor>::UserCommand>>,
         pub stopcounter: Arc<AtomicI32>,
         pub name: String,
         pub latency_batch: i32,
     }
-    impl NewServiceReactor for MyThreadedReactor {
-        type InitServiceParam = ThreadedServiceParam;
-        fn new_service_reactor(p: Self::InitServiceParam) -> Self {
+    impl NewServerReactor for MyThreadedReactor {
+        type InitServerParam = ThreadedServerParam;
+        fn new_server_reactor(p: Self::InitServerParam) -> Self {
             Self {
                 runtimeid: p.runtimeid,
                 reactormgr: p.reactormgr,
                 stopcounter: p.stopcounter,
-                reactor: MyReactor::new(
-                    (p.name + "-1").to_owned(),
-                    false,
-                    i32::MAX,
-                    p.latency_batch,
-                ),
+                inner: MyReactor::new((p.name + "-1").to_owned(), false, i32::MAX, p.latency_batch),
             }
         }
     }
@@ -221,24 +215,22 @@ pub mod example {
 
         fn on_connected(
             &mut self,
-            ctx: &mut crate::ReactorContext<Self::UserCommand>,
+            ctx: &mut crate::DispatchContext<Self::UserCommand>,
             listener: crate::ReactorID,
         ) -> bool {
-            self.reactor.dispatcher.parent_listener = listener;
-            logmsg!(
-                "[{}] connected sock: {:?}",
-                self.reactor.dispatcher.name,
-                ctx.sock
-            );
+            self.inner.parent_listener = listener;
+            logmsg!("[{}] connected sock: {:?}", self.inner.name, ctx.sock);
             // register <name, uid>
-            self.reactormgr.add_reactor_uid(
-                self.reactor.dispatcher.name.clone(),
-                super::ReactorUID {
-                    runtimeid: self.runtimeid,
-                    reactorid: ctx.reactorid,
-                },
-            ).expect("Duplicate reactor name");
-            if self.reactor.dispatcher.is_client {
+            self.reactormgr
+                .add_reactor_uid(
+                    self.inner.name.clone(),
+                    super::ReactorUID {
+                        runtimeid: self.runtimeid,
+                        reactorid: ctx.reactorid,
+                    },
+                )
+                .expect("Duplicate reactor name");
+            if self.inner.is_client {
                 // send cmd to self to start sending msg to server.
                 ctx.cmd_sender
                     .send_user_cmd(
@@ -262,21 +254,22 @@ pub mod example {
             // return self.reactor.on_connected(ctx, listener);
         }
 
-        fn on_readable(&mut self, ctx: &mut crate::ReactorContext<Self::UserCommand>) -> bool {
-            return self.reactor.on_readable(ctx);
+        fn on_inbound_message(
+            &mut self,
+            buf: &mut [u8],
+            decoded_msg_size: usize,
+            ctx: &mut crate::DispatchContext<Self::UserCommand>,
+        ) -> crate::MessageResult {
+            return self.inner.on_inbound_message(buf, decoded_msg_size, ctx);
         }
 
         fn on_command(
             &mut self,
             cmd: Self::UserCommand,
-            ctx: &mut crate::ReactorContext<Self::UserCommand>,
+            ctx: &mut crate::DispatchContext<Self::UserCommand>,
         ) {
-            logmsg!(
-                "[{}] **Recv user cmd** {}",
-                &self.reactor.dispatcher.name,
-                &cmd
-            );
-            if self.reactor.dispatcher.is_client {
+            logmsg!("[{}] **Recv user cmd** {}", &self.inner.name, &cmd);
+            if self.inner.is_client {
                 //-- test send cmd to server
                 let server_uid = self
                     .reactormgr
@@ -297,7 +290,7 @@ pub mod example {
                     .expect("Failed to send cmd to server");
 
                 //-- send initial msg
-                if !self.reactor.send_msg(ctx, "hello world") {
+                if !self.inner.send_msg(ctx, "hello world") {
                     ctx.cmd_sender
                         .send_close(ctx.reactorid, Deferred::Immediate, |_| {})
                         .expect("failed to send close cmd");
@@ -308,16 +301,17 @@ pub mod example {
     }
 
     pub fn create_tcp_listener(
-        param: ThreadedServiceParam,
+        param: ThreadedServerParam,
     ) -> DefaultTcpListenerHandler<MyThreadedReactor> {
         return DefaultTcpListenerHandler::<MyThreadedReactor>::new(param);
     }
 }
+
 #[cfg(test)]
 mod test {
     use atomic::AtomicI32;
 
-    use crate::threaded_reactors::example::{create_tcp_listener, ThreadedServiceParam};
+    use crate::threaded_reactors::example::{create_tcp_listener, ThreadedServerParam};
     use crate::Deferred;
 
     use super::*;
@@ -332,7 +326,7 @@ mod test {
             .unwrap()
             .send_listen(
                 addr,
-                create_tcp_listener(ThreadedServiceParam {
+                create_tcp_listener(ThreadedServerParam {
                     runtimeid: threadid0,
                     reactormgr: Arc::clone(&mgr),
                     stopcounter: Arc::clone(&stopcounter),
