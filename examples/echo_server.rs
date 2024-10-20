@@ -1,4 +1,4 @@
-use reactio::{example, logmsg, utils, DefaultTcpListenerHandler, ReactRuntime};
+use reactio::{example, logmsg, DefaultTcpListenerHandler, ReactRuntime};
 
 fn run(port: i32) {
     let addr = "127.0.0.1:".to_owned() + &port.to_string();
@@ -12,11 +12,10 @@ fn run(port: i32) {
                 latency_batch: 1000,
             }),
             reactio::Deferred::Immediate,
-            |result| match result {
-                reactio::CommandCompletion::Error(err) => {
-                    logmsg!("Failed to listen. err: {}", &err);
+            |result| {
+                if let reactio::CommandCompletion::Error(err) = result {
+                    logmsg!("Failed to listen. err: {}", err);
                 }
-                _ => {}
             },
         )
         .unwrap();

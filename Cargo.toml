@@ -3,13 +3,14 @@ name = "reactio"
 version = "0.1.0"
 edition = "2021"
 
-authors = ["Jack Zhang <zjgogle@gmail.com>"]
+authors = ["Jack Zhang <zjgoggle@gmail.com>"]
 rust-version = "1.63"
 description = "Portable Reactor Pattern"
 license = "Apache-2.0 OR MIT"
-repository = "https://github.com/zjgogle/polling"
-keywords = ["reactor", "non-blocking", "epoll", "iocp"]
-categories = ["event-driven", "network-programming", "os"]
+repository = "https://github.com/zjgoggle/reactio-rs"
+readme = "README.md"
+keywords = ["reactor", "multi-threads", "non-blocking", "epoll", "iocp"]
+categories = ["asynchronous", "concurrency", "network-programming", "os"]
 exclude = ["/.*"]
 
 
@@ -21,3 +22,11 @@ rustdoc-args = ["--cfg", "docsrs"]
 [dependencies]
 polling = "3.7"
 libc = "0.2"
+
+[[example]]
+name = "echo_client"
+path = "examples/echo_client.rs"
+
+[[example]]
+name = "echo_server"
+path = "examples/echo_server.rs"

@@ -1,4 +1,4 @@
-use reactio::{example, logmsg, utils, ReactRuntime};
+use reactio::{example, logmsg, ReactRuntime};
 
 fn run(port: i32, max_echos: i32, latency_batch: i32) {
     let addr = "127.0.0.1:".to_owned() + &port.to_string();
@@ -9,11 +9,10 @@ fn run(port: i32, max_echos: i32, latency_batch: i32) {
             &addr,
             example::MyReactor::new_client("client".to_owned(), max_echos, latency_batch),
             reactio::Deferred::Immediate,
-            |result| match result {
-                reactio::CommandCompletion::Error(err) => {
-                    logmsg!("Failed to connect. err: {}", &err);
+            |result| {
+                if let reactio::CommandCompletion::Error(err) = result {
+                    logmsg!("Failed to connect. err: {}", err);
                 }
-                _ => {}
             },
         )
         .unwrap();

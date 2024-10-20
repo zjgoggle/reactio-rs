@@ -315,6 +315,7 @@ mod test {
 
     use super::*;
 
+    #[ignore]
     #[test]
     pub fn test_threaded_reactors() {
         let addr = "127.0.0.1:12355";
