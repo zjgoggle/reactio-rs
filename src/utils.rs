@@ -1,26 +1,34 @@
 extern crate libc;
-use std::io::Write;
+use std::{io::Write, mem::size_of};
 
 pub fn ref_to_bytes<T>(val: &T) -> &[u8] {
-    unsafe {
-        return std::slice::from_raw_parts(val as *const T as *const u8, 1);
-    }
+    unsafe { std::slice::from_raw_parts(val as *const T as *const u8, size_of::<T>()) }
 }
 pub fn ref_to_bytes_mut<T>(val: &mut T) -> &mut [u8] {
-    unsafe {
-        return std::slice::from_raw_parts_mut(val as *mut T as *mut u8, 1);
-    }
+    unsafe { std::slice::from_raw_parts_mut(val as *mut T as *mut u8, size_of::<T>()) }
 }
 pub fn bytes_to_ref_mut<T>(buf: &mut [u8]) -> &mut T {
+    debug_assert!(
+        size_of::<T>() <= buf.len(),
+        "buf.len:{} < obj.size: {}",
+        buf.len(),
+        size_of::<T>()
+    );
     unsafe {
         let p = buf.as_mut_ptr() as *mut T;
-        return &mut *p;
+        &mut *p
     }
 }
 pub fn bytes_to_ref<T>(buf: &[u8]) -> &T {
+    debug_assert!(
+        size_of::<T>() <= buf.len(),
+        "buf.len:{} < obj.size: {}",
+        buf.len(),
+        size_of::<T>()
+    );
     unsafe {
         let p = buf.as_ptr() as *const T;
-        return &*p;
+        &*p
     }
 }
 
@@ -92,23 +100,23 @@ pub fn format_time(
 }
 
 pub fn now_nanos() -> i64 {
-    return std::time::SystemTime::now()
+    std::time::SystemTime::now()
         .duration_since(std::time::SystemTime::UNIX_EPOCH)
         .unwrap()
-        .as_nanos() as i64;
+        .as_nanos() as i64
 }
 
 // Useful when windows timespec_get has only low resolution.
 pub fn cpu_now_nanos() -> i64 {
     let epoch: std::time::Instant = unsafe { std::mem::MaybeUninit::zeroed().assume_init() };
-    return std::time::Instant::now().duration_since(epoch).as_nanos() as i64;
+    std::time::Instant::now().duration_since(epoch).as_nanos() as i64
 }
 
 #[macro_export]
 macro_rules! logmsg {
     ($( $args:expr ),*) => {
         let mut buf = [0u8; 40];
-        print!("[{}] ", crate::utils::format_time(&mut buf, crate::utils::now_nanos(), 6, false));
+        print!("[{}] ", $crate::utils::format_time(&mut buf, $crate::utils::now_nanos(), 6, false));
         println!( $( $args ),* );
         // std::io::stdout().flush().unwrap();
     }
@@ -120,7 +128,7 @@ macro_rules! logmsg {
 macro_rules! dbglog {
     ($( $args:expr ),*) => {
         let mut buf = [0u8; 40];
-        print!("[{}] [DBG] ", crate::utils::format_time(&mut buf, crate::utils::now_nanos(), 6, false));
+        print!("[{}] [DBG] ", $crate::utils::format_time(&mut buf, $crate::utils::now_nanos(), 6, false));
         println!( $( $args ),* );
         // std::io::stdout().flush().unwrap();
     }

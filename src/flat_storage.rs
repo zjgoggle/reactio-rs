@@ -14,6 +14,12 @@ enum AllocNode<T> {
     Occupied(T),
 }
 
+impl<T> Default for FlatStorage<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<T> FlatStorage<T> {
     pub fn new() -> Self {
         Self {
@@ -26,6 +32,9 @@ impl<T> FlatStorage<T> {
     pub fn len(&self) -> usize {
         self.count
     }
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
     pub fn count_free(&self) -> usize {
         self.data.len() - self.count
     }
@@ -37,7 +46,7 @@ impl<T> FlatStorage<T> {
         self.count += 1;
         if self.free == INVALID_ID {
             self.data.push(AllocNode::<T>::Occupied(val));
-            return self.data.len() - 1;
+            self.data.len() - 1
         } else {
             let key = self.free;
             match self.data[key] {
@@ -49,7 +58,7 @@ impl<T> FlatStorage<T> {
                 }
             }
             self.data[key] = AllocNode::<T>::Occupied(val);
-            return key;
+            key
         }
     }
 
@@ -57,17 +66,15 @@ impl<T> FlatStorage<T> {
         if key < self.data.len() {
             if let AllocNode::<T>::Vacant(_) = self.data[key] {
                 return None;
-            } else {
-                if let AllocNode::<T>::Occupied(val) =
-                    std::mem::replace(&mut self.data[key], AllocNode::<T>::Vacant(self.free))
-                {
-                    self.free = key;
-                    self.count -= 1;
-                    return Some(val);
-                }
+            } else if let AllocNode::<T>::Occupied(val) =
+                std::mem::replace(&mut self.data[key], AllocNode::<T>::Vacant(self.free))
+            {
+                self.free = key;
+                self.count -= 1;
+                return Some(val);
             }
         }
-        return None;
+        None
     }
 
     pub fn get(&self, key: usize) -> Option<&T> {
@@ -76,7 +83,7 @@ impl<T> FlatStorage<T> {
                 return Some(val);
             }
         }
-        return None;
+        None
     }
     pub fn get_mut(&mut self, key: usize) -> Option<&mut T> {
         if key < self.data.len() {
@@ -84,7 +91,7 @@ impl<T> FlatStorage<T> {
                 return Some(val);
             }
         }
-        return None;
+        None
     }
 }
 

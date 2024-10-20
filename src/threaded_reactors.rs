@@ -45,14 +45,17 @@ impl<UserCommand: 'static> ThreadedReactorMgr<UserCommand> {
 
         // let mut runtimes : Vec<Arc<Mutex<ReactRuntime<UserCommand>>>> = Vec::new(); // ReactRuntime cannot be accessed across threads.
         // runtimes.resize_with(size, || Arc::new(Mutex::new(ReactRuntime::new())));
-        let uninited_senders: Vec<Arc<Mutex<Option<CmdSender<UserCommand>>>>> =
-            vec![Arc::new(Mutex::new(None)); size]; // threads set each slot.
+        let uninited_senders: Vec<Arc<Mutex<Option<CmdSender<UserCommand>>>>> = {
+            let mut t = Vec::new(); // threads set each slot.
+            t.resize_with(size, || Arc::new(Mutex::new(None)));
+            t
+        };
         let count_inited_threads = Arc::new(AtomicI32::new(0));
         let startcmd = Arc::new(AtomicBool::new(false));
 
-        for i in 0..size {
+        for (i, uninited_sender) in uninited_senders.iter().enumerate() {
             let (stopcmd, startcmd) = (Arc::clone(&me.stopcmd), Arc::clone(&startcmd));
-            let uninited_sender = Arc::clone(&uninited_senders[i]);
+            let uninited_sender = Arc::clone(uninited_sender);
             let count_inited_threads = Arc::clone(&count_inited_threads);
             // let pruntime = Arc::clone(&runtimes[i]);
 
@@ -73,7 +76,7 @@ impl<UserCommand: 'static> ThreadedReactorMgr<UserCommand> {
                     count_inited_threads.fetch_add(1, atomic::Ordering::Relaxed);
                     drop(count_inited_threads);
 
-                    while startcmd.load(atomic::Ordering::Relaxed) != true {
+                    while !startcmd.load(atomic::Ordering::Relaxed) {
                         std::thread::sleep(std::time::Duration::from_millis(1));
                     }
                     drop(startcmd);
@@ -103,47 +106,44 @@ impl<UserCommand: 'static> ThreadedReactorMgr<UserCommand> {
             }
         }
         startcmd.store(true, atomic::Ordering::Relaxed);
-        return Arc::new(me);
+        Arc::new(me)
     }
 
     pub fn stop(&self) {
         self.stopcmd.store(true, atomic::Ordering::Relaxed);
     }
     pub fn wait(&mut self) {
-        let threads = std::mem::replace(&mut self.threads, Vec::new());
+        let threads = std::mem::take(&mut self.threads); // same as std::mem::replace(&mut self.threads, Vec::new());
         for t in threads.into_iter() {
             t.join().unwrap();
         }
     }
 
     fn get_sender(&self, runtimeid: usize) -> Option<&CmdSender<UserCommand>> {
-        return self.senders.get(runtimeid);
+        self.senders.get(runtimeid)
     }
 
     //----------------------------- UID Map --------------------------
     pub fn find_reactor_uid(&self, key: &str) -> Option<ReactorUID> {
         let mapguard = self.reactor_uid_map.lock().unwrap();
-        match mapguard.get(key) {
-            Some(uid) => Some(*uid),
-            _ => None,
-        }
+        mapguard.get(key).copied()
     }
-    // return error when key was already in the map.
-    pub fn add_reactor_uid(&self, key: ReactorName, value: ReactorUID) -> Result<(), ()> {
+    // return Err() when key was already in the map.
+    pub fn add_reactor_uid(&self, key: ReactorName, value: ReactorUID) -> Result<(), &'static str> {
         let mut mapguard = self.reactor_uid_map.lock().unwrap();
         match mapguard.insert(key, value) {
-            Some(_) => Err(()),
+            Some(_) => Err("Duplicate ReactorName"),
             _ => Ok(()),
         }
     }
 
     pub fn remove_reactor_name(&self, key: &str) -> Option<ReactorUID> {
         let mut mapguard = self.reactor_uid_map.lock().unwrap();
-        return mapguard.remove(key);
+        mapguard.remove(key)
     }
     pub fn count_reactors(&self) -> usize {
         let mapguard = self.reactor_uid_map.lock().unwrap();
-        return mapguard.len();
+        mapguard.len()
     }
 }
 
@@ -155,7 +155,6 @@ pub mod example {
     use crate::threaded_reactors::ThreadedReactorMgr;
     use crate::{example::MyReactor, DefaultTcpListenerHandler, Deferred, Reactor};
     use crate::{logmsg, NewServerReactor};
-    use std::i32;
     use std::sync::atomic::{self, AtomicI32};
     use std::sync::Arc;
 
@@ -171,15 +170,15 @@ pub mod example {
         pub fn new_client(
             name: ReactorName,
             runtimeid: usize,
-            mgr: Arc<ThreadedReactorMgr<<MyReactor as Reactor>::UserCommand>>,
+            reactormgr: Arc<ThreadedReactorMgr<<MyReactor as Reactor>::UserCommand>>,
             max_echo: i32,
             latency_batch: i32,
             stopcounter: Arc<AtomicI32>,
         ) -> Self {
             Self {
-                runtimeid: runtimeid,
-                reactormgr: mgr,
-                stopcounter: stopcounter,
+                runtimeid,
+                reactormgr,
+                stopcounter,
                 inner: MyReactor::new_client(name, max_echo, latency_batch),
             }
         }
@@ -250,7 +249,7 @@ pub mod example {
                     .send_close(listener, Deferred::Immediate, |_| {})
                     .unwrap();
             }
-            return true;
+            true
             // return self.reactor.on_connected(ctx, listener);
         }
 
@@ -260,7 +259,7 @@ pub mod example {
             decoded_msg_size: usize,
             ctx: &mut crate::DispatchContext<Self::UserCommand>,
         ) -> crate::MessageResult {
-            return self.inner.on_inbound_message(buf, decoded_msg_size, ctx);
+            self.inner.on_inbound_message(buf, decoded_msg_size, ctx)
         }
 
         fn on_command(
@@ -303,7 +302,7 @@ pub mod example {
     pub fn create_tcp_listener(
         param: ThreadedServerParam,
     ) -> DefaultTcpListenerHandler<MyThreadedReactor> {
-        return DefaultTcpListenerHandler::<MyThreadedReactor>::new(param);
+        DefaultTcpListenerHandler::<MyThreadedReactor>::new(param)
     }
 }
 
@@ -319,7 +318,7 @@ mod test {
     #[test]
     pub fn test_threaded_reactors() {
         let addr = "127.0.0.1:12355";
-        let stopcounter = Arc::new(AtomicI32::new(0));
+        let stopcounter = Arc::new(AtomicI32::new(0)); // each Reactor increases it when exiting.
         let mgr = ThreadedReactorMgr::<String>::new(2); // 2 threads
         let (threadid0, threadid1) = (0, 1);
         mgr.get_sender(threadid0)
@@ -354,7 +353,7 @@ mod test {
             )
             .unwrap();
 
-        // server reactor doesnot recv disconnection sometimes when removing sleep???
+        // wait for 2 reactors exit
         while stopcounter.load(atomic::Ordering::Relaxed) != 2 {
             std::thread::sleep(std::time::Duration::from_millis(1));
             std::thread::yield_now();

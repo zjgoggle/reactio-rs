@@ -6,7 +6,6 @@ use core::panic;
 use polling::{Event, Events, PollMode, Poller};
 use std::io::{ErrorKind, Read, Write};
 use std::time::Duration;
-use std::u32;
 use std::{marker::PhantomData, net::TcpStream};
 
 //====================================================================================
@@ -49,15 +48,15 @@ pub trait Reactor {
     /// This is a default implementation which uses MsgReader to read messages and calls on_inbound_message when a full message is read.
     /// * return false to close socket.
     fn on_readable(&mut self, ctx: &mut ReactorReableContext<Self::UserCommand>) -> bool {
-        return ctx.reader.try_read(
+        ctx.reader.try_read(
             &mut DispatchContext {
                 reactorid: ctx.reactorid,
-                sock: &mut ctx.sock,
-                sender: &mut ctx.sender,
-                cmd_sender: &ctx.cmd_sender,
+                sock: ctx.sock,
+                sender: ctx.sender,
+                cmd_sender: ctx.cmd_sender,
             },
             self,
-        );
+        )
     }
 
     /// ReactRuntime calls it when receiving a command.
@@ -81,7 +80,7 @@ impl<'a, UserCommand> DispatchContext<'a, UserCommand> {
             reactorid: data.reactorid,
             sock: &mut data.sock,
             sender: &mut data.sender,
-            cmd_sender: cmd_sender,
+            cmd_sender,
         }
     }
 }
@@ -119,7 +118,7 @@ unsafe impl<UserCommand> Send for CmdSender<UserCommand> {}
 
 impl<UserCommand> Clone for CmdSender<UserCommand> {
     fn clone(&self) -> Self {
-        Self { 0: self.0.clone() }
+        Self(self.0.clone())
     }
 }
 impl<UserCommand> CmdSender<UserCommand> {
@@ -136,12 +135,12 @@ impl<UserCommand> CmdSender<UserCommand> {
         deferred: Deferred,
         completion: impl FnOnce(CommandCompletion) + 'static,
     ) -> Result<(), String> {
-        return self.send_cmd(
+        self.send_cmd(
             INVALID_REACTOR_ID,
             SysCommand::NewConnect(remote_addr.to_owned(), Box::new(reactor)),
             deferred,
             completion,
-        );
+        )
     }
     /// Send a command to create a listen socket at IP:Port. The reactor will listen on the socket.
     pub fn send_listen<AReactor: TcpListenerHandler<UserCommand = UserCommand> + 'static>(
@@ -151,12 +150,12 @@ impl<UserCommand> CmdSender<UserCommand> {
         deferred: Deferred,
         completion: impl FnOnce(CommandCompletion) + 'static,
     ) -> Result<(), String> {
-        return self.send_cmd(
+        self.send_cmd(
             INVALID_REACTOR_ID,
             SysCommand::NewListen(local_addr.to_owned(), Box::new(reactor)),
             deferred,
             completion,
-        );
+        )
     }
 
     /// Send a command to close a reactor and it's socket.
@@ -166,7 +165,7 @@ impl<UserCommand> CmdSender<UserCommand> {
         deferred: Deferred,
         completion: impl FnOnce(CommandCompletion) + 'static,
     ) -> Result<(), String> {
-        return self.send_cmd(reactorid, SysCommand::CloseSocket, deferred, completion);
+        self.send_cmd(reactorid, SysCommand::CloseSocket, deferred, completion)
     }
 
     /// Send a UserCommand to a reactor with specified `reactorid`.
@@ -180,7 +179,7 @@ impl<UserCommand> CmdSender<UserCommand> {
         deferred: Deferred,
         completion: impl FnOnce(CommandCompletion) + 'static,
     ) -> Result<(), String> {
-        return self.send_cmd(reactorid, SysCommand::UserCmd(cmd), deferred, completion);
+        self.send_cmd(reactorid, SysCommand::UserCmd(cmd), deferred, completion)
     }
 
     fn send_cmd(
@@ -207,18 +206,19 @@ impl<UserCommand> CmdSender<UserCommand> {
             }
             _ => {}
         }
-        match self.0.send(CmdData::<UserCommand> {
-            reactorid: reactorid,
-            cmd: cmd,
-            deferred: deferred,
-            completion: Box::new(completion),
-        }) {
-            Err(_) => {
-                return Err("Failed to send. Receiver disconnected.".to_owned());
-            }
-            _ => {}
+        if self
+            .0
+            .send(CmdData::<UserCommand> {
+                reactorid,
+                cmd,
+                deferred,
+                completion: Box::new(completion),
+            })
+            .is_err()
+        {
+            return Err("Failed to send. Receiver disconnected.".to_owned());
         }
-        return Ok(());
+        Ok(())
     }
 }
 
@@ -271,7 +271,7 @@ struct DeferredKey {
 }
 impl DeferredKey {
     fn get_key(&self) -> i64 {
-        return self.millis;
+        self.millis
     }
 }
 
@@ -342,7 +342,7 @@ impl<'a, UserCommand> ReactorReableContext<'a, UserCommand> {
             sock: &mut data.sock,
             sender: &mut data.sender,
             reader: &mut data.reader,
-            cmd_sender: cmd_sender,
+            cmd_sender,
         }
     }
 }
@@ -356,15 +356,15 @@ impl ReactorID {
     /// convert to epoll event key
     pub fn to_usize(&self) -> usize {
         let halfbits = std::mem::size_of::<usize>() * 8 / 2;
-        return ((self.ver as usize) << halfbits) | (self.sockslot as usize);
+        ((self.ver as usize) << halfbits) | (self.sockslot as usize)
     }
     /// convert from epoll event key
     pub fn from_usize(val: usize) -> Self {
         let halfbits = std::mem::size_of::<usize>() * 8 / 2;
-        return Self {
+        Self {
             sockslot: val as u32,
             ver: (val >> halfbits) as u32,
-        };
+        }
     }
 }
 impl std::fmt::Display for ReactorID {
@@ -384,23 +384,23 @@ impl<UserCommand> ReactorMgr<UserCommand> {
             socket_handlers: FlatStorage::new(),
             poller: Poller::new().unwrap(),
             count_streams: 0,
-            cmd_sender: CmdSender { 0: cmd_sender },
-            cmd_recv: cmd_recv,
+            cmd_sender: CmdSender(cmd_sender),
+            cmd_recv,
         }
     }
     /// \return number of all managed socks.
     fn len(&self) -> usize {
         self.socket_handlers.len()
     }
-    fn add_stream<'a>(
-        &'a mut self,
+    fn add_stream(
+        &mut self,
         sock: std::net::TcpStream,
         handler: Box<dyn Reactor<UserCommand = UserCommand>>,
     ) -> ReactorID {
         let key = self.socket_handlers.add(TcpSocketHandler::StreamType(
             SockData {
                 reactorid: INVALID_REACTOR_ID,
-                sock: sock,
+                sock,
                 sender: MsgSender::new(),
                 reader: MsgReader::default(),
                 interested_writable: false,
@@ -465,7 +465,7 @@ impl<UserCommand> ReactorMgr<UserCommand> {
                 sock
             );
         }
-        return reactorid;
+        reactorid
     }
 
     /// Close & remove socket/reactor.
@@ -494,7 +494,7 @@ impl<UserCommand> ReactorMgr<UserCommand> {
             }
             return true;
         }
-        return false;
+        false
     }
 
     /// * local_addr - ip:port. e.g. "127.0.0.1:8000"
@@ -561,13 +561,9 @@ impl<UserCommand> ReactRuntime<UserCommand> {
     /// - return false when there's no reactor/socket or command, then this runtime could be destroyed.
     pub fn process_events(&mut self) -> bool {
         let has_events = self.process_sock_events();
-        let deferreds = self.process_deferred_queue();
+        self.process_deferred_queue();
         let cmds = self.process_command_queue();
-        return has_events
-            || deferreds > 0
-            || cmds > 0
-            || self.deferred_heap.len() > 0
-            || self.mgr.len() > 0;
+        has_events || cmds > 0 || !self.deferred_heap.is_empty() || self.mgr.len() > 0
     }
     /// return number of streams (non-listener reactors)
     pub fn count_streams(&self) -> usize {
@@ -630,12 +626,11 @@ impl<UserCommand> ReactRuntime<UserCommand> {
                                 dbglog!("WARN: unsolicited writable sock: {:?}", ctx.sock);
                             }
                             ctx.interested_writable = true; // in case unsolicited event.
-                            if ctx.sender.pending.len() > 0 {
-                                if SendOrQueResult::CloseOrError
+                            if !ctx.sender.pending.is_empty()
+                                && SendOrQueResult::CloseOrError
                                     == ctx.sender.send_queued(&mut ctx.sock)
-                                {
-                                    removesock = true;
-                                }
+                            {
+                                removesock = true;
                             }
                         }
                         if ev.readable {
@@ -649,7 +644,7 @@ impl<UserCommand> ReactRuntime<UserCommand> {
                         }
                         // add or remove write interest
                         if !removesock {
-                            if !ctx.interested_writable && ctx.sender.pending.len() > 0 {
+                            if !ctx.interested_writable && !ctx.sender.pending.is_empty() {
                                 self.mgr
                                     .poller
                                     .modify_with_mode(
@@ -659,7 +654,7 @@ impl<UserCommand> ReactRuntime<UserCommand> {
                                     )
                                     .unwrap();
                                 ctx.interested_writable = true;
-                            } else if ctx.interested_writable && ctx.sender.pending.len() == 0 {
+                            } else if ctx.interested_writable && ctx.sender.pending.is_empty() {
                                 self.mgr
                                     .poller
                                     .modify_with_mode(
@@ -723,7 +718,7 @@ impl<UserCommand> ReactRuntime<UserCommand> {
             }
         }
 
-        return !self.sock_events.is_empty();
+        !self.sock_events.is_empty()
     }
 
     /// return number of command procesed
@@ -754,10 +749,7 @@ impl<UserCommand> ReactRuntime<UserCommand> {
                     if !ReactRuntime::<UserCommand>::is_deferred_current(millis) {
                         // if beyond half millis tolerance
                         let key = self.deferred_data.add(cmddata);
-                        self.deferred_heap.push(DeferredKey {
-                            millis: millis,
-                            data: key,
-                        });
+                        self.deferred_heap.push(DeferredKey { millis, data: key });
                         min_heap_push(&mut self.deferred_heap);
                         continue; // continue loop recv
                     }
@@ -765,12 +757,12 @@ impl<UserCommand> ReactRuntime<UserCommand> {
             }
             self.execute_immediate_cmd(cmddata);
         } // loop
-        return count_cmd;
+        count_cmd
     }
 
     fn is_deferred_current(millis: i64) -> bool {
         let now_nanos = utils::now_nanos();
-        return millis * 1000000 + 5 * 100000 <= now_nanos;
+        millis * 1000000 + 5 * 100000 <= now_nanos
     }
 
     fn execute_immediate_cmd(&mut self, cmddata: CmdData<UserCommand>) {
@@ -811,54 +803,52 @@ impl<UserCommand> ReactRuntime<UserCommand> {
             SysCommand::UserCmd(usercmd) => {
                 if cmddata.reactorid == INVALID_REACTOR_ID {
                     panic!("UserCommand must be executed on a reactor!");
-                } else {
-                    if let Some(handler) = self
-                        .mgr
-                        .socket_handlers
-                        .get_mut(cmddata.reactorid.sockslot as usize)
-                    {
-                        match handler {
-                            TcpSocketHandler::ListenerType(reactorid, _, _) => {
-                                (cmddata.completion)(CommandCompletion::Error(format!(
+                } else if let Some(handler) = self
+                    .mgr
+                    .socket_handlers
+                    .get_mut(cmddata.reactorid.sockslot as usize)
+                {
+                    match handler {
+                        TcpSocketHandler::ListenerType(reactorid, _, _) => {
+                            (cmddata.completion)(CommandCompletion::Error(format!(
                                     "Listener cannot receive user command. cmd reactorid: {}, reactorid: {}",
                                     cmddata.reactorid, *reactorid
                                 )));
-                            }
-                            TcpSocketHandler::StreamType(ctx, reactor) => {
-                                if cmddata.reactorid != ctx.reactorid {
-                                    (cmddata.completion)(CommandCompletion::Error(format!(
+                        }
+                        TcpSocketHandler::StreamType(ctx, reactor) => {
+                            if cmddata.reactorid != ctx.reactorid {
+                                (cmddata.completion)(CommandCompletion::Error(format!(
                                         "Failed to execute user command with wrong cmd reactorid: {}, found: {}",
                                         cmddata.reactorid , ctx.reactorid
                                     )));
-                                } else {
-                                    (reactor).on_command(
-                                        usercmd,
-                                        &mut DispatchContext {
-                                            reactorid: cmddata.reactorid,
-                                            sock: &mut ctx.sock,
-                                            sender: &mut ctx.sender,
-                                            cmd_sender: &self.mgr.cmd_sender,
-                                        },
-                                    );
-                                    (cmddata.completion)(CommandCompletion::Completed(
-                                        cmddata.reactorid,
-                                    ));
-                                }
+                            } else {
+                                (reactor).on_command(
+                                    usercmd,
+                                    &mut DispatchContext {
+                                        reactorid: cmddata.reactorid,
+                                        sock: &mut ctx.sock,
+                                        sender: &mut ctx.sender,
+                                        cmd_sender: &self.mgr.cmd_sender,
+                                    },
+                                );
+                                (cmddata.completion)(CommandCompletion::Completed(
+                                    cmddata.reactorid,
+                                ));
                             }
                         }
-                    } else {
-                        (cmddata.completion)(CommandCompletion::Error(format!(
-                            "Failed to execute user command on non existing socket with reactorid: {}",
-                            cmddata.reactorid
-                        )));
                     }
+                } else {
+                    (cmddata.completion)(CommandCompletion::Error(format!(
+                        "Failed to execute user command on non existing socket with reactorid: {}",
+                        cmddata.reactorid
+                    )));
                 }
             }
         } // match cmd
     }
 
-    fn process_deferred_queue(&mut self) -> usize {
-        while self.deferred_heap.len() > 0
+    fn process_deferred_queue(&mut self) {
+        while !self.deferred_heap.is_empty()
             && ReactRuntime::<UserCommand>::is_deferred_current(self.deferred_heap[0].millis)
         {
             let key = self.deferred_heap[0].data;
@@ -870,7 +860,6 @@ impl<UserCommand> ReactRuntime<UserCommand> {
                 panic!("No deferred CommandData with key: {}", key);
             }
         }
-        return 0;
     }
 }
 
@@ -932,6 +921,11 @@ pub enum SendOrQueResult {
     InQueue,
     /// close socket.
     CloseOrError,
+}
+impl Default for MsgSender {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 impl MsgSender {
     pub fn new() -> Self {
@@ -998,7 +992,7 @@ impl MsgSender {
         }
         //---- queue the remaining bytes
         self.queue_msg(&buf[sentbytes..], send_completion);
-        return SendOrQueResult::InQueue;
+        SendOrQueResult::InQueue
     }
 
     fn queue_msg(&mut self, buf: &[u8], send_completion: impl Fn() + 'static) {
@@ -1093,10 +1087,10 @@ impl MsgSender {
             debug_assert_eq!(self.last_pending_id, usize::MAX);
             debug_assert_eq!(self.pending.len(), 0);
             self.bytes_sent = 0;
-            return SendOrQueResult::Complete;
+            SendOrQueResult::Complete
         } else {
             self.bytes_sent += sentbytes;
-            return SendOrQueResult::InQueue;
+            SendOrQueResult::InQueue
         }
     }
 }
@@ -1246,7 +1240,7 @@ impl<NewReactor: NewServerReactor + 'static> DefaultTcpListenerHandler<NewReacto
         Self {
             reactorid: INVALID_REACTOR_ID,
             server_param: param,
-            _phantom: PhantomData::default(),
+            _phantom: PhantomData,
         }
     }
 }
@@ -1283,8 +1277,8 @@ pub mod example {
 
     #[derive(Copy, Clone)]
     pub struct MsgHeader {
-        body_len: u16,
-        send_time: i64, // sending timestamp nanos since epoch
+        body_len: u16,  // 2 bytes
+        send_time: i64, // 8 bytes, sending timestamp nanos since epoch
     }
     const MSG_HEADER_SIZE: usize = 10;
     const LATENCY_BATCH_SIZE: i32 = 10000;
@@ -1332,7 +1326,7 @@ pub mod example {
                     .send_close(listener, Deferred::Immediate, |_| {})
                     .unwrap();
             }
-            return true;
+            true
         }
 
         fn on_inbound_message(
@@ -1347,8 +1341,8 @@ pub mod example {
                 if buf.len() < MSG_HEADER_SIZE {
                     return MessageResult::ExpectMsgSize(0); // partial header
                 }
-                let header: &MsgHeader = utils::bytes_to_ref(&buf[0..MSG_HEADER_SIZE]);
-                msg_size = header.body_len as usize + MSG_HEADER_SIZE;
+                let header_bodylen: &u16 = utils::bytes_to_ref(&buf[0..MSG_HEADER_SIZE]);
+                msg_size = *header_bodylen as usize + MSG_HEADER_SIZE;
 
                 if msg_size > buf.len() {
                     return MessageResult::ExpectMsgSize(msg_size); // decoded msg_size but still partial msg. need reading more.
@@ -1358,30 +1352,30 @@ pub mod example {
                                                   //---- process full message.
             let recvtime = utils::cpu_now_nanos();
             {
-                let header: &MsgHeader = utils::bytes_to_ref(&buf[0..MSG_HEADER_SIZE]);
-                debug_assert_eq!(header.body_len as usize + MSG_HEADER_SIZE, buf.len());
+                let header_bodylen: &u16 = utils::bytes_to_ref(&buf[0..MSG_HEADER_SIZE]);
+                let header_sendtime: &i64 = utils::bytes_to_ref(&buf[2..MSG_HEADER_SIZE]);
+                debug_assert_eq!(*header_bodylen as usize + MSG_HEADER_SIZE, buf.len());
 
                 if self.last_sent_time > 0 {
                     self.round_trip_durations
                         .push(recvtime - self.last_sent_time);
-                    self.single_trip_durations.push(recvtime - header.send_time);
+                    self.single_trip_durations.push(recvtime - *header_sendtime);
                     dbglog!(
                         "Recv msg sock: {:?} [{}, {}, {}] content: {} <{}>",
                         ctx.sock,
                         self.last_sent_time,
-                        header.send_time,
+                        *header_sendtime,
                         recvtime,
                         buf.len(),
                         std::str::from_utf8(&buf[MSG_HEADER_SIZE..]).unwrap()
                     );
                 }
             }
-            // here drop header because report_latencies is one more but borrow.
             if self.round_trip_durations.len() as i32 == self.latency_batch {
                 self.report_latencies();
             }
-            let header: &mut MsgHeader = utils::bytes_to_ref_mut(&mut buf[0..MSG_HEADER_SIZE]);
-            header.send_time = utils::cpu_now_nanos(); // update send_time only
+            let header_sendtime: &mut i64 = utils::bytes_to_ref_mut(&mut buf[2..MSG_HEADER_SIZE]);
+            *header_sendtime = utils::cpu_now_nanos(); // update send_time only
 
             if self.count_echo < self.max_echo {
                 self.last_sent_time = utils::cpu_now_nanos();
@@ -1392,9 +1386,9 @@ pub mod example {
                 }
 
                 self.count_echo += 1;
-                return MessageResult::DropMsgSize(msg_size);
+                MessageResult::DropMsgSize(msg_size)
             } else {
-                return MessageResult::Close;
+                MessageResult::Close
             }
         }
     }
@@ -1419,14 +1413,14 @@ pub mod example {
             self.round_trip_durations.clear();
         }
 
-        pub fn new(name: String, isclient: bool, a_max_echo: i32, a_latency_batch: i32) -> Self {
+        pub fn new(name: String, is_client: bool, max_echo: i32, latency_batch: i32) -> Self {
             Self {
-                name: name,
+                name,
                 parent_listener: INVALID_REACTOR_ID,
-                is_client: isclient,
-                max_echo: a_max_echo,
+                is_client,
+                max_echo,
                 count_echo: 0,
-                latency_batch: a_latency_batch,
+                latency_batch,
                 //
                 last_sent_time: 0,
                 single_trip_durations: Vec::new(),
@@ -1443,15 +1437,22 @@ pub mod example {
             let mut buf = vec![0u8; msg.len() + MSG_HEADER_SIZE];
 
             buf[MSG_HEADER_SIZE..(MSG_HEADER_SIZE + msg.len())].copy_from_slice(msg.as_bytes());
-            let header: &mut MsgHeader = utils::bytes_to_ref_mut(&mut buf[0..10]);
-            header.body_len = msg.len() as u16;
-            header.send_time = utils::cpu_now_nanos();
+            {
+                let header_bodylen: &mut u16 =
+                    utils::bytes_to_ref_mut(&mut buf[0..MSG_HEADER_SIZE]);
+                *header_bodylen = msg.len() as u16;
+            }
+            {
+                let header_sendtime: &mut i64 =
+                    utils::bytes_to_ref_mut(&mut buf[2..MSG_HEADER_SIZE]);
+                *header_sendtime = utils::cpu_now_nanos();
+            }
 
             //
             let res =
                 ctx.sender
-                    .send_or_que(&mut ctx.sock, &buf[..(msg.len() + MSG_HEADER_SIZE)], || {});
-            return res != SendOrQueResult::CloseOrError;
+                    .send_or_que(ctx.sock, &buf[..(msg.len() + MSG_HEADER_SIZE)], || {});
+            res != SendOrQueResult::CloseOrError
         }
     }
 
@@ -1498,6 +1499,7 @@ mod test {
                 |_| {},
             )
             .unwrap();
+        // In single threaded environment, process_events until there're no reactors, no events, no deferred events.
         while runtime.process_events() {}
         assert_eq!(runtime.count_reactors(), 0);
     }
