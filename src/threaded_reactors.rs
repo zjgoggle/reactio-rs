@@ -1,6 +1,6 @@
 use crate::{logmsg, CmdSender, ReactRuntime, ReactorID};
 use std::sync::{
-    atomic::{self, AtomicBool, AtomicI32},
+    atomic::{self, AtomicBool},
     Arc, Mutex,
 };
 
@@ -8,7 +8,7 @@ use std::sync::{
 /// There is also a map<ReactorName, ReactorID>, which is used to find the ReactorID with unique ReactorName and send command to Reactor with ReactorID.
 /// * **Note that each reactor must add itsef into reactor_uid_map by add_reactor_uid when on_connected and deregister itself by add_reactor_uid when on_close/on_drop.**
 pub struct ThreadedReactorMgr<UserCommand: 'static> {
-    senders: Vec<CmdSender<UserCommand>>,
+    senders: Vec<IDAndSender<UserCommand>>,
     threads: Vec<std::thread::JoinHandle<()>>,
     stopcmd: Arc<AtomicBool>,
     reactor_uid_map: Mutex<GlobalReactorUIDMap>,
@@ -22,7 +22,6 @@ pub struct ReactorUID {
     pub runtimeid: usize,
     pub reactorid: ReactorID,
 }
-
 struct IDAndSender<UserCommand>(usize, CmdSender<UserCommand>);
 unsafe impl<UserCommand> Send for IDAndSender<UserCommand> {}
 
@@ -35,7 +34,7 @@ impl<UserCommand: 'static> Drop for ThreadedReactorMgr<UserCommand> {
     }
 }
 impl<UserCommand: 'static> ThreadedReactorMgr<UserCommand> {
-    pub fn new(size: usize) -> Arc<Self> {
+    pub fn new(nthreads: usize) -> Arc<Self> {
         let mut me = Self {
             senders: Vec::new(),
             threads: Vec::new(),
@@ -45,45 +44,26 @@ impl<UserCommand: 'static> ThreadedReactorMgr<UserCommand> {
 
         // let mut runtimes : Vec<Arc<Mutex<ReactRuntime<UserCommand>>>> = Vec::new(); // ReactRuntime cannot be accessed across threads.
         // runtimes.resize_with(size, || Arc::new(Mutex::new(ReactRuntime::new())));
-        let uninited_senders: Vec<Arc<Mutex<Option<CmdSender<UserCommand>>>>> = {
-            let mut t = Vec::new(); // threads set each slot.
-            t.resize_with(size, || Arc::new(Mutex::new(None)));
-            t
-        };
-        let count_inited_threads = Arc::new(AtomicI32::new(0));
-        let startcmd = Arc::new(AtomicBool::new(false));
 
-        for (i, uninited_sender) in uninited_senders.iter().enumerate() {
-            let (stopcmd, startcmd) = (Arc::clone(&me.stopcmd), Arc::clone(&startcmd));
-            let uninited_sender = Arc::clone(uninited_sender);
-            let count_inited_threads = Arc::clone(&count_inited_threads);
-            // let pruntime = Arc::clone(&runtimes[i]);
+        let (tx, rx) = std::sync::mpsc::channel::<IDAndSender<UserCommand>>();
+
+        for threadid in 0..nthreads {
+            let (stopcmd, tx) = (Arc::clone(&me.stopcmd), tx.clone());
 
             let thread = std::thread::Builder::new()
-                .name(format!("ThreadedReactors-{}", i))
+                .name(format!("ThreadedReactors-{}", threadid))
                 .spawn(move || {
-                    let threadid = i;
                     logmsg!("Entered ThreadedReactors-{}", threadid);
-                    // let mut guard_runtime = pruntime.lock().unwrap();
-                    // let ref mut runtime = *guard_runtime;
                     let mut runtime = ReactRuntime::<UserCommand>::new();
-                    {
-                        let mut sender_guard = uninited_sender.lock().unwrap();
-                        *sender_guard = Some(runtime.get_cmd_sender().clone())
-                    }
-                    drop(uninited_sender);
+                    tx.send(IDAndSender(threadid, runtime.get_cmd_sender().clone()))
+                        .expect("Failed to send in thread");
+                    drop(tx);
 
-                    count_inited_threads.fetch_add(1, atomic::Ordering::Relaxed);
-                    drop(count_inited_threads);
-
-                    while !startcmd.load(atomic::Ordering::Relaxed) {
-                        std::thread::sleep(std::time::Duration::from_millis(1));
-                    }
-                    drop(startcmd);
                     logmsg!("Start polling events in ThreadedReactors-{}", threadid);
-                    while !stopcmd.load(atomic::Ordering::Relaxed) {
+                    while !stopcmd.load(atomic::Ordering::Acquire) {
                         runtime.process_events();
                         std::thread::yield_now();
+                        // MAYDO: update stats: sock_events, commands, deferred_queue_size, count_read_bytes, count_write_bytes
                     }
                     logmsg!("Exiting ThreadedReactors-{}", threadid);
                 })
@@ -92,20 +72,19 @@ impl<UserCommand: 'static> ThreadedReactorMgr<UserCommand> {
         }
 
         logmsg!("Waiting for thread initializations");
-        while count_inited_threads.load(atomic::Ordering::Relaxed) < size as i32 {
-            std::thread::sleep(std::time::Duration::from_millis(1));
+        let mut unsorted_senders = Vec::new();
+        for _ in 0..nthreads {
+            let sender = rx
+                .recv_timeout(std::time::Duration::from_millis(100))
+                .expect("failed to rect msg");
+            unsorted_senders.push(sender);
+        }
+        unsorted_senders.sort_by(|x, y| x.0.cmp(&y.0));
+        for (i, e) in unsorted_senders.into_iter().enumerate() {
+            debug_assert_eq!(i, e.0);
+            me.senders.push(e);
         }
         logmsg!("Recved all thread initializations");
-        {
-            for (i, sender) in uninited_senders.iter().enumerate() {
-                let guard = sender.lock().unwrap();
-                match &*guard {
-                    Some(s) => me.senders.push(s.clone()),
-                    _ => panic!("Thread-{} didn't set CmdSender", i),
-                }
-            }
-        }
-        startcmd.store(true, atomic::Ordering::Relaxed);
         Arc::new(me)
     }
 
@@ -119,8 +98,8 @@ impl<UserCommand: 'static> ThreadedReactorMgr<UserCommand> {
         }
     }
 
-    fn get_sender(&self, runtimeid: usize) -> Option<&CmdSender<UserCommand>> {
-        self.senders.get(runtimeid)
+    pub fn get_cmd_sender(&self, runtimeid: usize) -> Option<&CmdSender<UserCommand>> {
+        self.senders.get(runtimeid).map(|e| &e.1)
     }
 
     //----------------------------- UID Map --------------------------
@@ -200,12 +179,17 @@ pub mod example {
     }
     impl NewServerReactor for MyThreadedReactor {
         type InitServerParam = ThreadedServerParam;
-        fn new_server_reactor(p: Self::InitServerParam) -> Self {
+        fn new_server_reactor(count: usize, p: Self::InitServerParam) -> Self {
             Self {
                 runtimeid: p.runtimeid,
                 reactormgr: p.reactormgr,
                 stopcounter: p.stopcounter,
-                inner: MyReactor::new((p.name + "-1").to_owned(), false, i32::MAX, p.latency_batch),
+                inner: MyReactor::new(
+                    format!("{}-{}", p.name, count),
+                    false,
+                    i32::MAX,
+                    p.latency_batch,
+                ),
             }
         }
     }
@@ -256,10 +240,12 @@ pub mod example {
         fn on_inbound_message(
             &mut self,
             buf: &mut [u8],
+            new_bytes: usize,
             decoded_msg_size: usize,
             ctx: &mut crate::DispatchContext<Self::UserCommand>,
         ) -> crate::MessageResult {
-            self.inner.on_inbound_message(buf, decoded_msg_size, ctx)
+            self.inner
+                .on_inbound_message(buf, new_bytes, decoded_msg_size, ctx)
         }
 
         fn on_command(
@@ -276,8 +262,7 @@ pub mod example {
                     .expect("Failed to find server");
                 let sender_to_server = self
                     .reactormgr
-                    .senders
-                    .get(server_uid.runtimeid)
+                    .get_cmd_sender(server_uid.runtimeid)
                     .expect("Failed to find sender");
                 sender_to_server
                     .send_user_cmd(
@@ -311,18 +296,21 @@ mod test {
     use atomic::AtomicI32;
 
     use crate::threaded_reactors::example::{create_tcp_listener, ThreadedServerParam};
-    use crate::Deferred;
+    use crate::{CommandCompletion, Deferred};
 
     use super::*;
 
-    #[ignore]
     #[test]
     pub fn test_threaded_reactors() {
         let addr = "127.0.0.1:12355";
         let stopcounter = Arc::new(AtomicI32::new(0)); // each Reactor increases it when exiting.
         let mgr = ThreadedReactorMgr::<String>::new(2); // 2 threads
         let (threadid0, threadid1) = (0, 1);
-        mgr.get_sender(threadid0)
+
+        // cloned Arc are passed to threads.
+        let (amgr, astopcounter) = (Arc::clone(&mgr), Arc::clone(&stopcounter));
+
+        mgr.get_cmd_sender(threadid0)
             .unwrap()
             .send_listen(
                 addr,
@@ -334,30 +322,45 @@ mod test {
                     latency_batch: 1000,
                 }),
                 Deferred::Immediate,
-                |_| {},
-            )
-            .unwrap();
-        mgr.get_sender(threadid1)
-            .unwrap()
-            .send_connect(
-                addr,
-                example::MyThreadedReactor::new_client(
-                    "myclient".to_owned(),
-                    threadid1,
-                    Arc::clone(&mgr),
-                    5,
-                    1000,
-                    Arc::clone(&stopcounter),
-                ),
-                Deferred::Immediate,
-                |_| {},
+                //  when listen socket is ready, send another command to connect from another thread.
+                move |res| {
+                    if let CommandCompletion::Error(_) = res {
+                        logmsg!("[ERROR] Failed to listen exit!");
+                        return;
+                    }
+                    amgr.get_cmd_sender(threadid1)
+                        .unwrap()
+                        .send_connect(
+                            addr,
+                            example::MyThreadedReactor::new_client(
+                                "myclient".to_owned(),
+                                threadid1,
+                                Arc::clone(&amgr),
+                                5,
+                                1000,
+                                Arc::clone(&astopcounter),
+                            ),
+                            Deferred::Immediate,
+                            |res| {
+                                if let CommandCompletion::Error(_) = res {
+                                    logmsg!("[ERROR] Failed connect!");
+                                }
+                            },
+                        )
+                        .unwrap();
+                },
             )
             .unwrap();
 
         // wait for 2 reactors exit
+        let start = std::time::SystemTime::now();
         while stopcounter.load(atomic::Ordering::Relaxed) != 2 {
-            std::thread::sleep(std::time::Duration::from_millis(1));
+            std::thread::sleep(std::time::Duration::from_millis(10));
             std::thread::yield_now();
+            if start.elapsed().unwrap() >= std::time::Duration::from_millis(2000) {
+                logmsg!("ERROR: timeout waiting for reactors to complete");
+                break;
+            }
         }
     }
 }

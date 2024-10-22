@@ -38,6 +38,7 @@ jobs:
             rust: stable-x86_64-pc-windows-gnu
           - os: windows-latest
             rust: stable-x86_64-pc-windows-msvc
+
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust
