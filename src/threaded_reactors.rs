@@ -285,9 +285,10 @@ pub mod example {
     }
 
     pub fn create_tcp_listener(
+        recv_buffer_min_size: usize,
         param: ThreadedServerParam,
     ) -> DefaultTcpListenerHandler<MyThreadedReactor> {
-        DefaultTcpListenerHandler::<MyThreadedReactor>::new(param)
+        DefaultTcpListenerHandler::<MyThreadedReactor>::new(recv_buffer_min_size, param)
     }
 }
 
@@ -303,6 +304,7 @@ mod test {
     #[test]
     pub fn test_threaded_reactors() {
         let addr = "127.0.0.1:12355";
+        let recv_buffer_min_size = 1024;
         let stopcounter = Arc::new(AtomicI32::new(0)); // each Reactor increases it when exiting.
         let mgr = ThreadedReactorMgr::<String>::new(2); // 2 threads
         let (threadid0, threadid1) = (0, 1);
@@ -314,13 +316,16 @@ mod test {
             .unwrap()
             .send_listen(
                 addr,
-                create_tcp_listener(ThreadedServerParam {
-                    runtimeid: threadid0,
-                    reactormgr: Arc::clone(&mgr),
-                    stopcounter: Arc::clone(&stopcounter),
-                    name: "server".to_owned(),
-                    latency_batch: 1000,
-                }),
+                create_tcp_listener(
+                    recv_buffer_min_size,
+                    ThreadedServerParam {
+                        runtimeid: threadid0,
+                        reactormgr: Arc::clone(&mgr),
+                        stopcounter: Arc::clone(&stopcounter),
+                        name: "server".to_owned(),
+                        latency_batch: 1000,
+                    },
+                ),
                 Deferred::Immediate,
                 //  when listen socket is ready, send another command to connect from another thread.
                 move |res| {
@@ -332,6 +337,7 @@ mod test {
                         .unwrap()
                         .send_connect(
                             addr,
+                            recv_buffer_min_size,
                             example::MyThreadedReactor::new_client(
                                 "myclient".to_owned(),
                                 threadid1,

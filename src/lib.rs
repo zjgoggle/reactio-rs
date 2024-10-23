@@ -21,12 +21,13 @@
 //!     use reactio::example;
 //!     pub fn test_reactors_cmd() {
 //!         let addr = "127.0.0.1:12355";
+//!         let recv_buffer_min_size = 1024;
 //!         let mut runtime = ReactRuntime::new();
 //!         let cmd_sender = runtime.get_cmd_sender();
 //!         cmd_sender
 //!             .send_listen(
 //!                 addr,
-//!                 DefaultTcpListenerHandler::<example::MyReactor>::new(example::ServerParam {
+//!                 DefaultTcpListenerHandler::<example::MyReactor>::new(recv_buffer_min_size, example::ServerParam {
 //!                     name: "server".to_owned(),
 //!                     latency_batch: 1000,
 //!                 }),
@@ -37,6 +38,7 @@
 //!         cmd_sender
 //!             .send_connect(
 //!                 addr,
+//!                 recv_buffer_min_size,
 //!                 example::MyReactor::new_client("client".to_owned(), 2, 1000),
 //!                 Deferred::Immediate,
 //!                 |_| {},
@@ -58,6 +60,7 @@
 //!
 //! pub fn test_threaded_reactors() {
 //!     let addr = "127.0.0.1:12355";
+//!     let recv_buffer_min_size = 1024;
 //!     let stopcounter = Arc::new(atomic::AtomicI32::new(0)); // each Reactor increases it when exiting.
 //!     let mgr = ThreadedReactorMgr::<String>::new(2); // 2 threads
 //!     let (threadid0, threadid1) = (0, 1);
@@ -69,12 +72,14 @@
 //!         .unwrap()
 //!         .send_listen(
 //!             addr,
-//!             create_tcp_listener(ThreadedServerParam {
-//!                 runtimeid: threadid0,
-//!                 reactormgr: Arc::clone(&mgr),
-//!                 stopcounter: Arc::clone(&stopcounter),
-//!                 name: "server".to_owned(),
-//!                 latency_batch: 1000,
+//!             create_tcp_listener(
+//!                 recv_buffer_min_size,
+//!                 ThreadedServerParam {
+//!                     runtimeid: threadid0,
+//!                     reactormgr: Arc::clone(&mgr),
+//!                     stopcounter: Arc::clone(&stopcounter),
+//!                     name: "server".to_owned(),
+//!                     latency_batch: 1000,
 //!             }),
 //!             Deferred::Immediate,
 //!             //  when listen socket is ready, send another command to connect from another thread.
@@ -87,6 +92,7 @@
 //!                     .unwrap()
 //!                     .send_connect(
 //!                         addr,
+//!                         recv_buffer_min_size,
 //!                         example::MyThreadedReactor::new_client(
 //!                             "myclient".to_owned(),
 //!                             threadid1,

@@ -27,9 +27,11 @@ pub trait Reactor {
     /// * return true to accept the connection; false to close the connection.
     fn on_connected(
         &mut self,
-        ctx: &mut DispatchContext<Self::UserCommand>,
-        listener: ReactorID,
-    ) -> bool;
+        _ctx: &mut DispatchContext<Self::UserCommand>,
+        _listener: ReactorID,
+    ) -> bool {
+        true // accept the connection by default.
+    }
 
     /// It's called by in on_readable() when either decoded_msg_size==0 (meaning message size is unknown) or decoded_msg_size <= buf.len() (meaning a full message is read).
     ///
@@ -48,10 +50,11 @@ pub trait Reactor {
     ) -> MessageResult;
 
     /// ReactRuntime calls it when there's a readable event. `ctx.reader` could be used to read message. See `MsgReader` for usage.
-    /// This is a default implementation which uses MsgReader to read messages and calls on_inbound_message when a full message is read.
+    /// This is a default implementation which uses MsgReader to read all messages then call on_inbound_message to dispatch (default `try_read_fast_read`).
+    /// User may override this function to implement other strategies (e.g. `try_read_fast_dispatch``).
     /// * return false to close socket.
     fn on_readable(&mut self, ctx: &mut ReactorReableContext<Self::UserCommand>) -> bool {
-        ctx.reader.try_read(
+        ctx.reader.try_read_fast_read(
             &mut DispatchContext {
                 reactorid: ctx.reactorid,
                 sock: ctx.sock,
@@ -63,11 +66,19 @@ pub trait Reactor {
     }
 
     /// ReactRuntime calls it when receiving a command.
-    fn on_command(&mut self, cmd: Self::UserCommand, ctx: &mut DispatchContext<Self::UserCommand>);
+    fn on_command(
+        &mut self,
+        _cmd: Self::UserCommand,
+        ctx: &mut DispatchContext<Self::UserCommand>,
+    ) {
+        panic!("Please impl on_command for reactorid: {}", ctx.reactorid);
+    }
 
     /// ReactRuntime calls it when the reactor is removed from poller and before closing the socket.
     /// The Reactor will be destroyed after this call.
-    fn on_close(&mut self, _cmd_sender: &CmdSender<Self::UserCommand>) {}
+    fn on_close(&mut self, _reactorid: ReactorID, _cmd_sender: &CmdSender<Self::UserCommand>) {
+        // noops by defaut
+    }
 }
 
 /// `DispatchContext` contains all info that could be used to dispatch command/message to reactors.
@@ -92,11 +103,11 @@ impl<'a, UserCommand> DispatchContext<'a, UserCommand> {
 pub enum MessageResult {
     /// Error or close. Exit message reading and close socket.
     Close,
-    /// Expecting more read, indicating decoded/expected message size. If it's non-zero, `on_inbound_message`` will not be called until full message is read;
+    /// Having received a partial message. Expecting more, indicating decoded/expected message size. If it's non-zero, `on_inbound_message`` will not be called until full message is read;
     ///     if it's 0, meaning the message size is unknown, `on_inbound_message` will be called everytime when there are any bytes read.
     /// * **Note that when calling on_inbound_message(decoded_msg_size) -> ExpectMsgSize(expect_msg_size), if expect_msg_size!=0, it should be always > msg_size.**
     ExpectMsgSize(usize),
-    /// msg has been processed, indicating bytes to drop.
+    /// Full message has been processed, indicating bytes to drop. Next call `on_inbound_message` with argument decoded_msgsize=0 and all rest bytes will be treated as unprocessed.
     DropMsgSize(usize),
 }
 
@@ -134,13 +145,18 @@ impl<UserCommand> CmdSender<UserCommand> {
     pub fn send_connect<AReactor: Reactor<UserCommand = UserCommand> + 'static>(
         &self,
         remote_addr: &str,
+        recv_buffer_min_size: usize,
         reactor: AReactor,
         deferred: Deferred,
         completion: impl FnOnce(CommandCompletion) + 'static,
     ) -> Result<(), String> {
         self.send_cmd(
             INVALID_REACTOR_ID,
-            SysCommand::NewConnect(remote_addr.to_owned(), Box::new(reactor)),
+            SysCommand::NewConnect(
+                Box::new(reactor),
+                remote_addr.to_owned(),
+                recv_buffer_min_size,
+            ),
             deferred,
             completion,
         )
@@ -155,7 +171,7 @@ impl<UserCommand> CmdSender<UserCommand> {
     ) -> Result<(), String> {
         self.send_cmd(
             INVALID_REACTOR_ID,
-            SysCommand::NewListen(local_addr.to_owned(), Box::new(reactor)),
+            SysCommand::NewListen(Box::new(reactor), local_addr.to_owned()),
             deferred,
             completion,
         )
@@ -194,7 +210,7 @@ impl<UserCommand> CmdSender<UserCommand> {
     ) -> Result<(), String> {
         // check NewConnect/NewListen when reactor == INVALID.
         match &cmd {
-            SysCommand::NewListen(_, _) | SysCommand::NewConnect(_, _) => {
+            SysCommand::NewListen(_, _) | SysCommand::NewConnect(_, _, _) => {
                 if reactorid != INVALID_REACTOR_ID {
                     return Err(
                         "reactorid msut be INVALID_REACTOR_ID if NewConnect/NewListen".to_owned(),
@@ -241,15 +257,19 @@ pub trait TcpListenerHandler {
     /// called when the listen socket starts listeing.
     fn on_start_listen(&mut self, reactorid: ReactorID, cmd_sender: &CmdSender<Self::UserCommand>);
 
-    /// \return null to close new connection.
+    //// return (Reactor, recv_buffer_min_size) or None to close the new connection.
     fn on_new_connection(
         &mut self,
         sock: &mut std::net::TcpListener,
         new_sock: &mut std::net::TcpStream,
         addr: std::net::SocketAddr,
-    ) -> Option<Box<dyn Reactor<UserCommand = Self::UserCommand>>>;
+    ) -> Option<NewStreamConnection<Self::UserCommand>>;
 
-    fn on_close(&mut self, _cmd_sender: &CmdSender<Self::UserCommand>) {}
+    fn on_close(&mut self, _reactorid: ReactorID, _cmd_sender: &CmdSender<Self::UserCommand>) {}
+}
+pub struct NewStreamConnection<UserCommand> {
+    pub reactor: Box<dyn Reactor<UserCommand = UserCommand>>,
+    pub recv_buffer_min_size: usize,
 }
 
 /// ReactRuntime manages & owns Reactors which receive/send socket data or command.
@@ -406,6 +426,7 @@ impl<UserCommand> ReactorMgr<UserCommand> {
     }
     fn add_stream(
         &mut self,
+        recv_buffer_min_size: usize,
         sock: std::net::TcpStream,
         handler: Box<dyn Reactor<UserCommand = UserCommand>>,
     ) -> ReactorID {
@@ -414,7 +435,7 @@ impl<UserCommand> ReactorMgr<UserCommand> {
                 reactorid: INVALID_REACTOR_ID,
                 sock,
                 sender: MsgSender::new(),
-                reader: MsgReader::default(),
+                reader: MsgReader::new(recv_buffer_min_size),
                 interested_writable: false,
             },
             handler,
@@ -495,13 +516,13 @@ impl<UserCommand> ReactorMgr<UserCommand> {
                     );
                     self.count_streams -= 1;
                     self.poller.delete(&sockdata.sock).unwrap();
-                    (reactor).on_close(&self.cmd_sender);
+                    (reactor).on_close(reactorid, &self.cmd_sender);
                 }
                 TcpSocketHandler::ListenerType(areactorid, sock, mut reactor) => {
                     debug_assert_eq!(reactorid, areactorid);
                     logmsg!("removing reactorid: {}, sock: {:?}", reactorid, sock);
                     self.poller.delete(&sock).unwrap();
-                    (reactor).on_close(&self.cmd_sender);
+                    (reactor).on_close(reactorid, &self.cmd_sender);
                 }
             }
             return true;
@@ -532,11 +553,12 @@ impl<UserCommand> ReactorMgr<UserCommand> {
     fn start_connect(
         &mut self,
         remote_addr: &str,
+        recv_buffer_min_size: usize,
         handler: Box<dyn Reactor<UserCommand = UserCommand>>,
     ) -> std::io::Result<ReactorID> {
         let socket = TcpStream::connect(remote_addr)?;
         socket.set_nonblocking(true)?; // FIXME: use blocking socket and each nonblocking read and blocking write.
-        let reactorid = self.add_stream(socket, handler);
+        let reactorid = self.add_stream(recv_buffer_min_size, socket, handler);
         if let TcpSocketHandler::StreamType(ref mut sockdata, ref mut handler) = self
             .socket_handlers
             .get_mut(reactorid.sockslot as usize)
@@ -632,11 +654,15 @@ impl<UserCommand> ReactRuntime<UserCommand> {
                         debug_assert_eq!(current_reactorid, *reactorid);
                         if ev.readable {
                             let (mut newsock, addr) = sock.accept().unwrap();
-                            if let Some(newhandler) =
+                            if let Some(new_stream_connection) =
                                 handler.on_new_connection(sock, &mut newsock, addr)
                             {
                                 newsock.set_nonblocking(true).unwrap();
-                                new_connection_to_add = Some((newsock, newhandler));
+                                new_connection_to_add = Some((
+                                    newsock,
+                                    new_stream_connection.reactor,
+                                    new_stream_connection.recv_buffer_min_size,
+                                ));
                             }
                             // else newsock will auto destroy
                         }
@@ -699,9 +725,11 @@ impl<UserCommand> ReactRuntime<UserCommand> {
                 continue;
             }
 
-            if let Some((newsock, newhandler)) = new_connection_to_add {
+            if let Some((newsock, newhandler, recv_buffer_min_size)) = new_connection_to_add {
                 let newreactorid_to_close = {
-                    let newreactorid = self.mgr.add_stream(newsock, newhandler);
+                    let newreactorid =
+                        self.mgr
+                            .add_stream(recv_buffer_min_size, newsock, newhandler);
                     if let TcpSocketHandler::StreamType(ref mut newsockdata, ref mut newhandler) =
                         self.mgr
                             .socket_handlers
@@ -813,8 +841,11 @@ impl<UserCommand> ReactRuntime<UserCommand> {
 
     fn execute_immediate_cmd(&mut self, cmddata: CmdData<UserCommand>) {
         match cmddata.cmd {
-            SysCommand::NewConnect(remote_addr, reactor) => {
-                match self.mgr.start_connect(&remote_addr, reactor) {
+            SysCommand::NewConnect(reactor, remote_addr, recv_buffer_min_size) => {
+                match self
+                    .mgr
+                    .start_connect(&remote_addr, recv_buffer_min_size, reactor)
+                {
                     Err(err) => {
                         let errmsg =
                             format!("Failed to connect to {}. Error: {}", remote_addr, err);
@@ -825,7 +856,7 @@ impl<UserCommand> ReactRuntime<UserCommand> {
                     }
                 }
             }
-            SysCommand::NewListen(local_addr, reactor) => {
+            SysCommand::NewListen(reactor, local_addr) => {
                 match self.mgr.start_listen(&local_addr, reactor) {
                     Err(err) => {
                         let errmsg = format!("Failed to listen on {}. Error: {}", local_addr, err);
@@ -900,10 +931,14 @@ impl<UserCommand> ReactRuntime<UserCommand> {
 
 enum SysCommand<UserCommand> {
     //-- system commands are processed by Runtime, Reactor will not receive them.
-    NewConnect(String, Box<dyn Reactor<UserCommand = UserCommand>>), // connect to remote IP:Port
+    NewConnect(
+        Box<dyn Reactor<UserCommand = UserCommand>>,
+        String, // connect to remote IP:Port
+        usize,  // min_recev_buffer_size
+    ),
     NewListen(
-        String,
         Box<dyn TcpListenerHandler<UserCommand = UserCommand>>,
+        String, // connect to remote IP:Port
     ), // listen on IP:Port
     CloseSocket,
     UserCmd(UserCommand),
@@ -1134,34 +1169,29 @@ impl MsgSender {
 //====================================================================================
 
 /// `MsgReader` is a per-socket helper to read socket messages. It auto handles partial/multiple messages in recv buffer.  
-/// On Readable event, call MsgReader::try_read() to read messages from a sock into a recv_buffer and calls dispatcher::on_inbound_message to dispatch message.
+/// On Readable event, call MsgReader::try_read_fast_dispatch/try_read_fast_read to read messages from a sock into a recv_buffer and calls dispatcher::on_inbound_message to dispatch message.
 pub struct MsgReader {
     recv_buffer: Vec<u8>,
-    min_reserve: usize,
+    min_reserve: usize,     // the min reserved buffer size before each read
     startpos: usize,        // msg start position or first effective byte.
     bufsize: usize,         // count from buffer[0] to last read byte.
     decoded_msgsize: usize, // decoded msg size from MessageResult::ExpectMsgSize,
 }
 
-impl Default for MsgReader {
-    fn default() -> Self {
-        Self::new(1024)
-    }
-}
 impl MsgReader {
-    pub fn new(min_recv_buf_reserve: usize) -> Self {
+    pub fn new(min_reserved_bytes: usize) -> Self {
         Self {
             // dispatcher : dispatch,
-            recv_buffer: Vec::new(),
-            min_reserve: min_recv_buf_reserve,
+            recv_buffer: vec![0u8; min_reserved_bytes],
+            min_reserve: min_reserved_bytes,
             startpos: 0,
             bufsize: 0,
             decoded_msgsize: 0,
         }
     }
 
-    /// On each readable event, call this function to read socket message into recv_buffer and dispatches messsage.
-    pub fn try_read<UserCommand>(
+    /// Strategy 1: fast dispatch: dispatch on each read of about min_reserve bytes.
+    pub fn try_read_fast_dispatch<UserCommand>(
         &mut self,
         ctx: &mut DispatchContext<UserCommand>,
         dispatcher: &mut (impl Reactor<UserCommand = UserCommand> + ?Sized),
@@ -1178,7 +1208,7 @@ impl MsgReader {
                 ); // double buffer size
             }
             match ctx.sock.read(&mut self.recv_buffer[self.bufsize..]) {
-                std::io::Result::Ok(mut new_bytes) => {
+                std::io::Result::Ok(new_bytes) => {
                     if new_bytes == 0 {
                         logmsg!("peer closed sock: {:?}", ctx.sock);
                         return false;
@@ -1187,51 +1217,12 @@ impl MsgReader {
 
                     self.bufsize += new_bytes;
                     let should_return = self.bufsize < self.recv_buffer.len(); // not full, no need to retry this time.
-                                                                               // loop while: buf_not_empty and ( partial_header or partial_msg )
-                    while self.startpos < self.bufsize
-                        && (self.decoded_msgsize == 0
-                            || self.startpos + self.decoded_msgsize <= self.bufsize)
-                    {
-                        match dispatcher.on_inbound_message(
-                            &mut self.recv_buffer[self.startpos..self.bufsize],
-                            new_bytes,
-                            self.decoded_msgsize,
-                            ctx,
-                        ) {
-                            MessageResult::ExpectMsgSize(msgsize) => {
-                                if !(msgsize == 0 || msgsize > self.bufsize - self.startpos) {
-                                    logmsg!( "[WARN] on_inbound_message should NOT expect a msgsize while full message is already received, which may cause recursive call. msgsize:{msgsize:?} startpos:{} endpos: {}",
-                                        self.startpos,
-                                        self.bufsize);
-                                    debug_assert!(
-                                        false,
-                                        "on_inbound_message expects an already full message."
-                                    );
-                                }
-                                self.decoded_msgsize = msgsize; // could be 0 if msg size is unknown.
-                                new_bytes = 0; // all has been processed.
-                            }
-                            MessageResult::DropMsgSize(msgsize) => {
-                                assert!(msgsize > 0 && msgsize <= self.bufsize - self.startpos); // drop size should not exceed buffer size.
-                                self.startpos += msgsize;
-                                self.decoded_msgsize = 0;
-                                new_bytes = self.bufsize - self.startpos;
-                            }
-                            MessageResult::Close => {
-                                logmsg!("Dispatch requested closing sock: {:?}. ", ctx.sock);
-                                return false;
-                            }
-                        }
-                    }
-                    if self.startpos != 0 {
-                        // move front
-                        self.recv_buffer.copy_within(self.startpos..self.bufsize, 0); // don't resize.
-                        self.bufsize -= self.startpos;
-                        self.startpos = 0;
+
+                    if !self.try_dispatch_all(new_bytes, ctx, dispatcher) {
+                        return false;
                     }
                     if should_return {
-                        // not full.
-                        return true; // wait for next readable.
+                        return true; // not full, wait for next readable.
                     } else {
                         continue; // try next read.
                     }
@@ -1256,6 +1247,112 @@ impl MsgReader {
             }
         }
     }
+
+    /// Read until WOULDBLOCK.
+    /// return false if there's any error or peer closed; return true, if WouldBlock.
+    pub fn try_read_all<UserCommand>(&mut self, ctx: &mut DispatchContext<UserCommand>) -> bool {
+        loop {
+            if self.bufsize + self.min_reserve > self.recv_buffer.len() {
+                self.recv_buffer.resize(
+                    std::cmp::max(self.bufsize + self.min_reserve, self.recv_buffer.len() * 2),
+                    0,
+                ); // double buffer size
+            }
+            match ctx.sock.read(&mut self.recv_buffer[self.bufsize..]) {
+                std::io::Result::Ok(new_bytes) => {
+                    if new_bytes == 0 {
+                        logmsg!("peer closed sock: {:?}", ctx.sock);
+                        return false;
+                    }
+                    debug_assert!(self.bufsize + new_bytes <= self.recv_buffer.len());
+
+                    self.bufsize += new_bytes;
+                    if self.bufsize < self.recv_buffer.len() {
+                        // not full, no need to retry this time.
+                        return true;
+                    }
+                }
+                std::io::Result::Err(err) => {
+                    let errkind = err.kind();
+                    if errkind == ErrorKind::WouldBlock {
+                        return true; // wait for next readable.
+                    } else if errkind == ErrorKind::ConnectionReset {
+                        logmsg!("sock reset : {:?}. close socket", ctx.sock);
+                        return false; // socket closed
+                    } else if errkind == ErrorKind::Interrupted {
+                        logmsg!("[WARN] sock Interrupted : {:?}. retry", ctx.sock);
+                        return true; // Interrupted is not an error.
+                    } else if errkind == ErrorKind::ConnectionAborted {
+                        logmsg!("sock ConnectionAborted : {:?}. close socket", ctx.sock); // closed by remote (windows)
+                        return false; // close socket.
+                    }
+                    logmsg!("[ERROR]: read on sock {:?}, error: {err:?}", ctx.sock);
+                    return false;
+                }
+            } // match
+        } // loop
+    }
+
+    /// try dispatch all messages in buffer.
+    /// return false if there's any error
+    pub fn try_dispatch_all<UserCommand>(
+        &mut self,
+        new_bytes: usize,
+        ctx: &mut DispatchContext<UserCommand>,
+        dispatcher: &mut (impl Reactor<UserCommand = UserCommand> + ?Sized),
+    ) -> bool {
+        let mut new_bytes = new_bytes;
+        // loop while: buf_not_empty and ( partial_header or partial_msg )
+        while self.startpos < self.bufsize
+            && (self.decoded_msgsize == 0 || self.startpos + self.decoded_msgsize <= self.bufsize)
+        {
+            match dispatcher.on_inbound_message(
+                &mut self.recv_buffer[self.startpos..self.bufsize],
+                new_bytes,
+                self.decoded_msgsize,
+                ctx,
+            ) {
+                MessageResult::ExpectMsgSize(msgsize) => {
+                    if !(msgsize == 0 || msgsize > self.bufsize - self.startpos) {
+                        logmsg!( "[WARN] on_inbound_message should NOT expect a msgsize while full message is already received, which may cause recursive call. msgsize:{msgsize:?} recved: {}",
+                            self.bufsize - self.startpos);
+                        debug_assert!(false, "on_inbound_message expects an already full message.");
+                    }
+                    self.decoded_msgsize = msgsize; // could be 0 if msg size is unknown.
+                    new_bytes = 0; // all has been processed.
+                }
+                MessageResult::DropMsgSize(msgsize) => {
+                    assert!(msgsize > 0 && msgsize <= self.bufsize - self.startpos); // drop size should not exceed buffer size.
+                    self.startpos += msgsize;
+                    self.decoded_msgsize = 0;
+                    new_bytes = self.bufsize - self.startpos;
+                }
+                MessageResult::Close => {
+                    logmsg!("Dispatch requested closing sock: {:?}. ", ctx.sock);
+                    return false;
+                }
+            }
+        }
+        if self.startpos != 0 {
+            // move front
+            self.recv_buffer.copy_within(self.startpos..self.bufsize, 0); // don't resize.
+            self.bufsize -= self.startpos;
+            self.startpos = 0;
+        }
+        true
+    }
+
+    /// Strategy 2: fast read: read all until WOULDBLOCK, then dispatch all.
+    pub fn try_read_fast_read<UserCommand>(
+        &mut self,
+        ctx: &mut DispatchContext<UserCommand>,
+        dispatcher: &mut (impl Reactor<UserCommand = UserCommand> + ?Sized),
+    ) -> bool {
+        let old_bytes = self.bufsize - self.startpos;
+        let ok = self.try_read_all(ctx);
+        let ok2 = self.try_dispatch_all(self.bufsize - self.startpos - old_bytes, ctx, dispatcher);
+        ok && ok2
+    }
 }
 
 //====================================================================================
@@ -1274,17 +1371,22 @@ pub struct DefaultTcpListenerHandler<NewReactor: NewServerReactor + 'static> {
     pub reactorid: ReactorID,
     count_children: usize,
     server_param: <NewReactor as NewServerReactor>::InitServerParam,
+    recv_buffer_min_size: usize,
     _phantom: PhantomData<NewReactor>,
 }
 
 //---------------------- !NewServerReactor ----------------
 
 impl<NewReactor: NewServerReactor + 'static> DefaultTcpListenerHandler<NewReactor> {
-    pub fn new(param: <NewReactor as NewServerReactor>::InitServerParam) -> Self {
+    pub fn new(
+        recv_buffer_min_size: usize,
+        param: <NewReactor as NewServerReactor>::InitServerParam,
+    ) -> Self {
         Self {
             reactorid: INVALID_REACTOR_ID,
             count_children: 0,
             server_param: param,
+            recv_buffer_min_size,
             _phantom: PhantomData,
         }
     }
@@ -1307,12 +1409,15 @@ impl<NewReactor: NewServerReactor + 'static> TcpListenerHandler
         _conn: &mut std::net::TcpListener,
         _new_conn: &mut std::net::TcpStream,
         _addr: std::net::SocketAddr,
-    ) -> Option<Box<dyn Reactor<UserCommand = Self::UserCommand>>> {
+    ) -> Option<NewStreamConnection<Self::UserCommand>> {
         self.count_children += 1;
-        Some(Box::new(NewReactor::new_server_reactor(
-            self.count_children,
-            self.server_param.clone(),
-        )))
+        Some(NewStreamConnection {
+            reactor: Box::new(NewReactor::new_server_reactor(
+                self.count_children,
+                self.server_param.clone(),
+            )),
+            recv_buffer_min_size: self.recv_buffer_min_size,
+        })
     }
 }
 //====================================================================================
@@ -1531,15 +1636,19 @@ mod test {
     #[test]
     pub fn test_reactors_cmd() {
         let addr = "127.0.0.1:12355";
+        let recv_buffer_min_size = 1024;
         let mut runtime = ReactRuntime::new();
         let cmd_sender = runtime.get_cmd_sender();
         cmd_sender
             .send_listen(
                 addr,
-                DefaultTcpListenerHandler::<example::MyReactor>::new(ServerParam {
-                    name: "server".to_owned(),
-                    latency_batch: 1000,
-                }),
+                DefaultTcpListenerHandler::<example::MyReactor>::new(
+                    recv_buffer_min_size,
+                    ServerParam {
+                        name: "server".to_owned(),
+                        latency_batch: 1000,
+                    },
+                ),
                 Deferred::Immediate,
                 |_| {},
             )
@@ -1547,6 +1656,7 @@ mod test {
         cmd_sender
             .send_connect(
                 addr,
+                recv_buffer_min_size,
                 example::MyReactor::new_client("client".to_owned(), 2, 1000),
                 Deferred::Immediate,
                 |_| {},

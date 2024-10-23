@@ -2,15 +2,19 @@ use reactio::{example, logmsg, DefaultTcpListenerHandler, ReactRuntime};
 
 fn run(port: i32) {
     let addr = "127.0.0.1:".to_owned() + &port.to_string();
+    let recv_buffer_min_size = 1024;
     let mut runtime = ReactRuntime::new();
     let cmd_sender = runtime.get_cmd_sender();
     cmd_sender
         .send_listen(
             &addr,
-            DefaultTcpListenerHandler::<example::MyReactor>::new(example::ServerParam {
-                name: "server".to_owned(),
-                latency_batch: 1000,
-            }),
+            DefaultTcpListenerHandler::<example::MyReactor>::new(
+                recv_buffer_min_size,
+                example::ServerParam {
+                    name: "server".to_owned(),
+                    latency_batch: 1000,
+                },
+            ),
             reactio::Deferred::Immediate,
             |result| {
                 if let reactio::CommandCompletion::Error(err) = result {
