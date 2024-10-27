@@ -118,6 +118,33 @@ pub fn cpu_now_nanos() -> i64 {
     std::time::Instant::now().duration_since(epoch).as_nanos() as i64
 }
 
+pub struct Timer {
+    start: i64,
+    target: i64,
+}
+impl Timer {
+    pub fn new_millis(duration_millis: i64) -> Self {
+        let start = cpu_now_nanos();
+        Self {
+            start,
+            target: duration_millis * 1000000 + start,
+        }
+    }
+    pub fn expired(&self) -> bool {
+        cpu_now_nanos() >= self.target
+    }
+    pub fn elapsed_millis(&self) -> i64 {
+        (cpu_now_nanos() - self.start) / 1000000
+    }
+    /// sleep for max of duration_millis and target time.
+    pub fn sleep_or_expire(&self, duration_millis: i64) {
+        std::thread::sleep(std::time::Duration::from_millis(std::cmp::min(
+            duration_millis,
+            self.target - cpu_now_nanos(),
+        ) as u64));
+    }
+}
+
 #[macro_export]
 macro_rules! logmsg {
     ($( $args:expr ),*) => {

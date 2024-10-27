@@ -1,4 +1,5 @@
-use reactio::{example, logmsg, ReactRuntime};
+use reactio::{logmsg, ReactRuntime};
+mod example;
 
 fn run(port: i32, max_echos: i32, latency_batch: i32) {
     let addr = "127.0.0.1:".to_owned() + &port.to_string();
@@ -9,7 +10,11 @@ fn run(port: i32, max_echos: i32, latency_batch: i32) {
         .send_connect(
             &addr,
             recv_buffer_min_size,
-            example::MyReactor::new_client("client".to_owned(), max_echos, latency_batch),
+            example::pingpong::PingpongReactor::new_client(
+                "client".to_owned(),
+                max_echos,
+                latency_batch,
+            ),
             reactio::Deferred::Immediate,
             |result| {
                 if let reactio::CommandCompletion::Error(err) = result {

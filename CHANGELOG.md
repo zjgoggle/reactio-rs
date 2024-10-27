@@ -1,4 +1,6 @@
 # Version 0.1.3
+- Support Result<_, String>. return Err to close reactor.
+- Add SimpleIoReactor, SimpleIoListener, CommandReactor.
 - TODO: two stage MsgSender: write messages to send_buf and send finnally.
 - TODO: support non-socket reactors.
 
