@@ -5,11 +5,11 @@ edition = "2021"
 
 authors = ["Jack Zhang <zjgoggle@gmail.com>"]
 rust-version = "1.63"
-description = "Portable Reactor Pattern"
+description = "Event Driven Nonblocking Reactor Pattern"
 license = "Apache-2.0 OR MIT"
 repository = "https://github.com/zjgoggle/reactio-rs"
 readme = "README.md"
-keywords = ["reactor", "multi-threads", "non-blocking", "epoll", "iocp"]
+keywords = ["reactor", "event-driven", "non-blocking", "epoll", "iocp"]
 categories = ["asynchronous", "concurrency", "network-programming", "os"]
 exclude = ["/.*"]
 

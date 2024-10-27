@@ -65,6 +65,12 @@ pub fn format_time(
     subsecond_digits: u32, // only be 0, 3, 6, 9
     gmt_time: bool,
 ) -> &str {
+    debug_assert!(
+        subsecond_digits == 0
+            || subsecond_digits == 3
+            || subsecond_digits == 6
+            || subsecond_digits == 9
+    );
     debug_assert!(buffer.len() as u32 > 17 + subsecond_digits + 1);
     let (seconds, nanos) = (nownanos / 1000000000, nownanos % 1000000000);
     let mut tm: libc::tm = unsafe { std::mem::MaybeUninit::zeroed().assume_init() };
@@ -144,9 +150,22 @@ macro_rules! dbglog {
 
 #[cfg(test)]
 mod test {
+    use std::io::Write;
+
+    // use libc::write;
 
     #[test]
-    pub fn test_reactio() {
+    pub fn test_vec_write() {
+        let mut v = Vec::<u8>::new();
+        // v.write_fmt(format_args!("hello{}", 2)).expect("failed to write to vec");
+        v.resize(10, 1);
+        let mut s = &mut v[..];
+        s.write_fmt(format_args!("hello{}", 2))
+            .expect("failed to write to slice");
+        logmsg!("vec size: {}", v.len());
+    }
+    #[test]
+    pub fn test_log() {
         let mut _buf = [0u8; 32];
         dbglog!("test dbglog.");
         logmsg!("any msg");

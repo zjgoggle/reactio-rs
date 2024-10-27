@@ -11,7 +11,7 @@ pub struct ThreadedReactorMgr<UserCommand: 'static> {
     senders: Vec<IDAndSender<UserCommand>>,
     threads: Vec<std::thread::JoinHandle<()>>,
     stopcmd: Arc<AtomicBool>,
-    reactor_uid_map: Mutex<GlobalReactorUIDMap>,
+    reactor_uid_map: Mutex<GlobalReactorUIDMap>, // MAYDO: remove mutex. each thread has a UIDMap. broadcast ReactorName removal/deletion.
 }
 
 type ReactorName = String;
@@ -98,20 +98,23 @@ impl<UserCommand: 'static> ThreadedReactorMgr<UserCommand> {
         }
     }
 
+    /// Get `CmdSender` for the runtimeid/threadid. We use CmdSender to send commands to that ReactRuntime running in thread with threadid.
     pub fn get_cmd_sender(&self, runtimeid: usize) -> Option<&CmdSender<UserCommand>> {
         self.senders.get(runtimeid).map(|e| &e.1)
     }
 
     //----------------------------- UID Map --------------------------
+
+    /// Find ReactorUID(runtimeid, reactorid) with the ReactorName.
     pub fn find_reactor_uid(&self, key: &str) -> Option<ReactorUID> {
         let mapguard = self.reactor_uid_map.lock().unwrap();
         mapguard.get(key).copied()
     }
     // return Err() when key was already in the map.
-    pub fn add_reactor_uid(&self, key: ReactorName, value: ReactorUID) -> Result<(), &'static str> {
+    pub fn add_reactor_uid(&self, key: ReactorName, value: ReactorUID) -> Result<(), String> {
         let mut mapguard = self.reactor_uid_map.lock().unwrap();
         match mapguard.insert(key, value) {
-            Some(_) => Err("Duplicate ReactorName"),
+            Some(_) => Err("Duplicate ReactorName".to_owned()),
             _ => Ok(()),
         }
     }
@@ -120,6 +123,7 @@ impl<UserCommand: 'static> ThreadedReactorMgr<UserCommand> {
         let mut mapguard = self.reactor_uid_map.lock().unwrap();
         mapguard.remove(key)
     }
+    /// count reactors that managed by UID Map (or added by `add_reactor_uid`)
     pub fn count_reactors(&self) -> usize {
         let mapguard = self.reactor_uid_map.lock().unwrap();
         mapguard.len()
@@ -200,40 +204,35 @@ pub mod example {
             &mut self,
             ctx: &mut crate::DispatchContext<Self::UserCommand>,
             listener: crate::ReactorID,
-        ) -> bool {
+        ) -> crate::Result<()> {
             self.inner.parent_listener = listener;
             logmsg!("[{}] connected sock: {:?}", self.inner.name, ctx.sock);
             // register <name, uid>
-            self.reactormgr
-                .add_reactor_uid(
-                    self.inner.name.clone(),
-                    super::ReactorUID {
-                        runtimeid: self.runtimeid,
-                        reactorid: ctx.reactorid,
-                    },
-                )
-                .expect("Duplicate reactor name");
+            self.reactormgr.add_reactor_uid(
+                self.inner.name.clone(),
+                super::ReactorUID {
+                    runtimeid: self.runtimeid,
+                    reactorid: ctx.reactorid,
+                },
+            )?;
             if self.inner.is_client {
                 // send cmd to self to start sending msg to server.
-                ctx.cmd_sender
-                    .send_user_cmd(
-                        ctx.reactorid,
-                        "StartSending".to_owned(),
-                        Deferred::UtilTime(
-                            std::time::SystemTime::now()
-                                .checked_add(std::time::Duration::from_millis(10))
-                                .expect("Failed att time!"),
-                        ),
-                        |_| {},
-                    )
-                    .expect("Failed too send user cmd!");
+                ctx.cmd_sender.send_user_cmd(
+                    ctx.reactorid,
+                    "StartSending".to_owned(),
+                    Deferred::UtilTime(
+                        std::time::SystemTime::now()
+                            .checked_add(std::time::Duration::from_millis(10))
+                            .expect("Failed att time!"),
+                    ),
+                    |_| {},
+                )?;
             } else {
                 // server
                 ctx.cmd_sender
-                    .send_close(listener, Deferred::Immediate, |_| {})
-                    .unwrap();
+                    .send_close(listener, Deferred::Immediate, |_| {})?;
             }
-            true
+            Ok(())
             // return self.reactor.on_connected(ctx, listener);
         }
 
@@ -243,7 +242,7 @@ pub mod example {
             new_bytes: usize,
             decoded_msg_size: usize,
             ctx: &mut crate::DispatchContext<Self::UserCommand>,
-        ) -> crate::MessageResult {
+        ) -> crate::Result<crate::MessageResult> {
             self.inner
                 .on_inbound_message(buf, new_bytes, decoded_msg_size, ctx)
         }
@@ -252,33 +251,34 @@ pub mod example {
             &mut self,
             cmd: Self::UserCommand,
             ctx: &mut crate::DispatchContext<Self::UserCommand>,
-        ) {
+        ) -> crate::Result<()> {
             logmsg!("[{}] **Recv user cmd** {}", &self.inner.name, &cmd);
             if self.inner.is_client {
                 //-- test send cmd to server
                 let server_uid = self
                     .reactormgr
                     .find_reactor_uid("server-1")
-                    .expect("Failed to find server");
+                    .ok_or_else(|| format!("ERROR: Failed to find server name: {}", "server-1"))?;
                 let sender_to_server = self
                     .reactormgr
                     .get_cmd_sender(server_uid.runtimeid)
-                    .expect("Failed to find sender");
-                sender_to_server
-                    .send_user_cmd(
-                        server_uid.reactorid,
-                        "TestCmdFromClient".to_owned(),
-                        Deferred::Immediate,
-                        |_| {},
-                    )
-                    .expect("Failed to send cmd to server");
+                    .ok_or_else(|| {
+                        format!(
+                            "ERROR: failed to find sender by runtimeid: {}",
+                            server_uid.runtimeid
+                        )
+                    })?;
+                sender_to_server.send_user_cmd(
+                    server_uid.reactorid,
+                    "TestCmdFromClient".to_owned(),
+                    Deferred::Immediate,
+                    |_| {},
+                )?;
 
                 //-- send initial msg
-                if !self.inner.send_msg(ctx, "hello world") {
-                    ctx.cmd_sender
-                        .send_close(ctx.reactorid, Deferred::Immediate, |_| {})
-                        .expect("failed to send close cmd");
-                }
+                self.inner.send_msg(ctx, "hello world")
+            } else {
+                Ok(())
             }
             // self.reactor.on_command(cmd, ctx);
         }
@@ -312,6 +312,8 @@ mod test {
         // cloned Arc are passed to threads.
         let (amgr, astopcounter) = (Arc::clone(&mgr), Arc::clone(&stopcounter));
 
+        // send a command to mgr to create a listener in threadid0.
+        // When the listen socket is ready (command is completed), send another command to connect from threadid1.
         mgr.get_cmd_sender(threadid0)
             .unwrap()
             .send_listen(
@@ -327,7 +329,7 @@ mod test {
                     },
                 ),
                 Deferred::Immediate,
-                //  when listen socket is ready, send another command to connect from another thread.
+                // OnCompletion, when listen socket is ready, send another command to connect from another thread.
                 move |res| {
                     if let CommandCompletion::Error(_) = res {
                         logmsg!("[ERROR] Failed to listen exit!");

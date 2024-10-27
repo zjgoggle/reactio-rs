@@ -24,13 +24,13 @@ pub trait Reactor {
     /// * `ctx`  - The context the used for reactor to send socket message or command.
     ///   * **Note that ctx.cmd_sener can only send command to a reactor that belongs to the same ReactRuntime.**
     /// * `listener` - The listener ID when the reactor is created by a listener socket; otherwise, it's INVALID_REACTOR_ID.
-    /// * return true to accept the connection; false to close the connection.
+    /// * return err to close socket.
     fn on_connected(
         &mut self,
         _ctx: &mut DispatchContext<Self::UserCommand>,
         _listener: ReactorID,
-    ) -> bool {
-        true // accept the connection by default.
+    ) -> Result<()> {
+        Ok(()) // accept the connection by default.
     }
 
     /// It's called by in on_readable() when either decoded_msg_size==0 (meaning message size is unknown) or decoded_msg_size <= buf.len() (meaning a full message is read).
@@ -47,13 +47,13 @@ pub trait Reactor {
         new_bytes: usize,
         decoded_msg_size: usize,
         ctx: &mut DispatchContext<Self::UserCommand>,
-    ) -> MessageResult;
+    ) -> Result<MessageResult>;
 
     /// ReactRuntime calls it when there's a readable event. `ctx.reader` could be used to read message. See `MsgReader` for usage.
     /// This is a default implementation which uses MsgReader to read all messages then call on_inbound_message to dispatch (default `try_read_fast_read`).
     /// User may override this function to implement other strategies (e.g. `try_read_fast_dispatch``).
-    /// * return false to close socket.
-    fn on_readable(&mut self, ctx: &mut ReactorReableContext<Self::UserCommand>) -> bool {
+    /// * return Err to close socket.
+    fn on_readable(&mut self, ctx: &mut ReactorReableContext<Self::UserCommand>) -> Result<()> {
         ctx.reader.try_read_fast_read(
             &mut DispatchContext {
                 reactorid: ctx.reactorid,
@@ -65,12 +65,13 @@ pub trait Reactor {
         )
     }
 
-    /// ReactRuntime calls it when receiving a command.
+    /// ReactRuntime calls it when receiving a command. If no user command is used (e.g. `type UserCommand=();`), user may not need to override it.
+    /// return Err to close the socket.
     fn on_command(
         &mut self,
         _cmd: Self::UserCommand,
         ctx: &mut DispatchContext<Self::UserCommand>,
-    ) {
+    ) -> Result<()> {
         panic!("Please impl on_command for reactorid: {}", ctx.reactorid);
     }
 
@@ -80,6 +81,8 @@ pub trait Reactor {
         // noops by defaut
     }
 }
+
+pub type Result<T> = std::result::Result<T, String>;
 
 /// `DispatchContext` contains all info that could be used to dispatch command/message to reactors.
 pub struct DispatchContext<'a, UserCommand> {
@@ -97,12 +100,13 @@ impl<'a, UserCommand> DispatchContext<'a, UserCommand> {
             cmd_sender,
         }
     }
+    pub fn send_msg(&mut self, msg: &[u8]) -> Result<SendOrQueResult> {
+        self.sender.send_or_que(self.sock, msg, || {})
+    }
 }
 
 /// `MessageResult` is returned by `on_inbound_message` to indicate result.
 pub enum MessageResult {
-    /// Error or close. Exit message reading and close socket.
-    Close,
     /// Having received a partial message. Expecting more, indicating decoded/expected message size. If it's non-zero, `on_inbound_message`` will not be called until full message is read;
     ///     if it's 0, meaning the message size is unknown, `on_inbound_message` will be called everytime when there are any bytes read.
     /// * **Note that when calling on_inbound_message(decoded_msg_size) -> ExpectMsgSize(expect_msg_size), if expect_msg_size!=0, it should be always > msg_size.**
@@ -149,7 +153,7 @@ impl<UserCommand> CmdSender<UserCommand> {
         reactor: AReactor,
         deferred: Deferred,
         completion: impl FnOnce(CommandCompletion) + 'static,
-    ) -> Result<(), String> {
+    ) -> Result<()> {
         self.send_cmd(
             INVALID_REACTOR_ID,
             SysCommand::NewConnect(
@@ -168,7 +172,7 @@ impl<UserCommand> CmdSender<UserCommand> {
         reactor: AReactor,
         deferred: Deferred,
         completion: impl FnOnce(CommandCompletion) + 'static,
-    ) -> Result<(), String> {
+    ) -> Result<()> {
         self.send_cmd(
             INVALID_REACTOR_ID,
             SysCommand::NewListen(Box::new(reactor), local_addr.to_owned()),
@@ -183,7 +187,7 @@ impl<UserCommand> CmdSender<UserCommand> {
         reactorid: ReactorID,
         deferred: Deferred,
         completion: impl FnOnce(CommandCompletion) + 'static,
-    ) -> Result<(), String> {
+    ) -> Result<()> {
         self.send_cmd(reactorid, SysCommand::CloseSocket, deferred, completion)
     }
 
@@ -197,7 +201,7 @@ impl<UserCommand> CmdSender<UserCommand> {
         cmd: UserCommand,
         deferred: Deferred,
         completion: impl FnOnce(CommandCompletion) + 'static,
-    ) -> Result<(), String> {
+    ) -> Result<()> {
         self.send_cmd(reactorid, SysCommand::UserCmd(cmd), deferred, completion)
     }
 
@@ -207,7 +211,7 @@ impl<UserCommand> CmdSender<UserCommand> {
         cmd: SysCommand<UserCommand>,
         deferred: Deferred,
         completion: impl FnOnce(CommandCompletion) + 'static,
-    ) -> Result<(), String> {
+    ) -> Result<()> {
         // check NewConnect/NewListen when reactor == INVALID.
         match &cmd {
             SysCommand::NewListen(_, _) | SysCommand::NewConnect(_, _, _) => {
@@ -262,7 +266,6 @@ pub trait TcpListenerHandler {
         &mut self,
         sock: &mut std::net::TcpListener,
         new_sock: &mut std::net::TcpStream,
-        addr: std::net::SocketAddr,
     ) -> Option<NewStreamConnection<Self::UserCommand>>;
 
     fn on_close(&mut self, _reactorid: ReactorID, _cmd_sender: &CmdSender<Self::UserCommand>) {}
@@ -383,6 +386,11 @@ pub struct ReactorID {
     ver: HalfUsize,      // must be half of usize
 }
 
+pub const INVALID_REACTOR_ID: ReactorID = ReactorID {
+    sockslot: HalfUsize::MAX,
+    ver: HalfUsize::MAX,
+};
+
 impl ReactorID {
     /// convert to epoll event key
     pub fn to_usize(&self) -> usize {
@@ -403,11 +411,6 @@ impl std::fmt::Display for ReactorID {
         write!(f, "{}:{}", self.sockslot, self.ver)
     }
 }
-
-pub const INVALID_REACTOR_ID: ReactorID = ReactorID {
-    sockslot: HalfUsize::MAX,
-    ver: HalfUsize::MAX,
-};
 
 impl<UserCommand> ReactorMgr<UserCommand> {
     fn new() -> Self {
@@ -545,9 +548,9 @@ impl<UserCommand> ReactorMgr<UserCommand> {
             .unwrap()
         {
             handler.on_start_listen(reactorid, &self.cmd_sender);
-            return Result::Ok(reactorid);
+            return std::io::Result::Ok(reactorid);
         }
-        Result::Ok(INVALID_REACTOR_ID)
+        std::io::Result::Ok(INVALID_REACTOR_ID)
     }
 
     fn start_connect(
@@ -564,15 +567,18 @@ impl<UserCommand> ReactorMgr<UserCommand> {
             .get_mut(reactorid.sockslot as usize)
             .unwrap()
         {
-            if handler.on_connected(
-                &mut DispatchContext::from(sockdata, &self.cmd_sender),
-                INVALID_REACTOR_ID,
-            ) {
-                return Result::Ok(reactorid);
+            if handler
+                .on_connected(
+                    &mut DispatchContext::from(sockdata, &self.cmd_sender),
+                    INVALID_REACTOR_ID,
+                )
+                .is_ok()
+            {
+                return std::io::Result::Ok(reactorid);
             }
         }
         self.close_reactor(reactorid);
-        Result::Ok(INVALID_REACTOR_ID)
+        std::io::Result::Ok(INVALID_REACTOR_ID)
     }
 }
 
@@ -610,17 +616,20 @@ impl<UserCommand> ReactRuntime<UserCommand> {
     pub fn count_reactors(&self) -> usize {
         self.mgr.len()
     }
-    /// return number if deferred commands in deferred queue (not command queue)
+    /// return number if deferred commands in deferred queue which saves deferred commands.
+    /// **Note: there's also an internal command queue that is used to receive commands**
     pub fn count_deferred_queue(&self) -> usize {
         self.deferred_data.len()
     }
-    /// return number of streams (non-listener reactors)
+    /// return number of streams (excluding listeners)
     pub fn count_streams(&self) -> usize {
         self.mgr.count_streams
     }
+    /// return total number of received socket events.
     pub fn count_sock_events(&self) -> usize {
         self.accum_sock_events
     }
+    /// return total number of received commands.
     pub fn count_received_commands(&self) -> usize {
         self.accum_commands
     }
@@ -653,9 +662,9 @@ impl<UserCommand> ReactRuntime<UserCommand> {
                     TcpSocketHandler::ListenerType(reactorid, sock, handler) => {
                         debug_assert_eq!(current_reactorid, *reactorid);
                         if ev.readable {
-                            let (mut newsock, addr) = sock.accept().unwrap();
+                            let (mut newsock, _) = sock.accept().unwrap();
                             if let Some(new_stream_connection) =
-                                handler.on_new_connection(sock, &mut newsock, addr)
+                                handler.on_new_connection(sock, &mut newsock)
                             {
                                 newsock.set_nonblocking(true).unwrap();
                                 new_connection_to_add = Some((
@@ -678,18 +687,23 @@ impl<UserCommand> ReactRuntime<UserCommand> {
                                 dbglog!("WARN: unsolicited writable sock: {:?}", ctx.sock);
                             }
                             ctx.interested_writable = true; // in case unsolicited event.
-                            if !ctx.sender.pending.is_empty()
-                                && SendOrQueResult::CloseOrError
-                                    == ctx.sender.send_queued(&mut ctx.sock)
-                            {
-                                removesock = true;
+                            if !ctx.sender.pending.is_empty() {
+                                if let Err(err) = ctx.sender.send_queued(&mut ctx.sock) {
+                                    logmsg!("{err}  send_queued failed.");
+                                    removesock = true;
+                                }
                             }
                         }
                         if ev.readable {
-                            removesock = !handler.on_readable(&mut ReactorReableContext::from(
+                            if let Err(err) = handler.on_readable(&mut ReactorReableContext::from(
                                 ctx,
                                 &self.mgr.cmd_sender,
-                            ));
+                            )) {
+                                if !err.is_empty() {
+                                    logmsg!("on_readable requested close current_reactorid: {current_reactorid}, sock: {:?}", ctx.sock);
+                                }
+                                removesock = true;
+                            }
                         }
                         if ctx.sender.close_or_error {
                             removesock = true;
@@ -736,13 +750,17 @@ impl<UserCommand> ReactRuntime<UserCommand> {
                             .get_mut(newreactorid.sockslot as usize)
                             .unwrap()
                     {
-                        if newhandler.on_connected(
+                        match newhandler.on_connected(
                             &mut DispatchContext::from(newsockdata, &self.mgr.cmd_sender),
                             current_reactorid,
                         ) {
-                            INVALID_REACTOR_ID // accept it, don't close it.
-                        } else {
-                            newsockdata.reactorid // close it.
+                            Ok(_) => INVALID_REACTOR_ID, // accept it, don't close it.
+                            Err(err) => {
+                                if !err.is_empty() {
+                                    logmsg!("Reject new connection for listener_reactorid: {}. Reason: {}", current_reactorid, err);
+                                }
+                                newsockdata.reactorid // close it.
+                            }
                         }
                     } else {
                         panic!("Failed to find new added stream!");
@@ -840,6 +858,7 @@ impl<UserCommand> ReactRuntime<UserCommand> {
     }
 
     fn execute_immediate_cmd(&mut self, cmddata: CmdData<UserCommand>) {
+        let mut reactorid_to_close: ReactorID = INVALID_REACTOR_ID;
         match cmddata.cmd {
             SysCommand::NewConnect(reactor, remote_addr, recv_buffer_min_size) => {
                 match self
@@ -899,7 +918,7 @@ impl<UserCommand> ReactRuntime<UserCommand> {
                                         cmddata.reactorid , ctx.reactorid
                                     )));
                             } else {
-                                (reactor).on_command(
+                                let res = (reactor).on_command(
                                     usercmd,
                                     &mut DispatchContext {
                                         reactorid: cmddata.reactorid,
@@ -911,6 +930,14 @@ impl<UserCommand> ReactRuntime<UserCommand> {
                                 (cmddata.completion)(CommandCompletion::Completed(
                                     cmddata.reactorid,
                                 ));
+                                if let Err(err) = res {
+                                    logmsg!(
+                                        "on_command requested closing reactorid: {}. {}",
+                                        cmddata.reactorid,
+                                        err
+                                    );
+                                    reactorid_to_close = cmddata.reactorid;
+                                }
                             }
                         }
                     }
@@ -922,6 +949,10 @@ impl<UserCommand> ReactRuntime<UserCommand> {
                 }
             }
         } // match cmd
+
+        if reactorid_to_close != INVALID_REACTOR_ID {
+            self.mgr.close_reactor(reactorid_to_close);
+        }
     }
 }
 
@@ -985,8 +1016,6 @@ pub enum SendOrQueResult {
     Complete,
     /// message in queue
     InQueue,
-    /// close socket.
-    CloseOrError,
 }
 impl Default for MsgSender {
     fn default() -> Self {
@@ -1004,6 +1033,8 @@ impl MsgSender {
             close_or_error: false,
         }
     }
+    // TODO: two stage send: acquire SendBuffer, append multiple messages to buffer; then send.
+
     /// Send the message or queue it if unabe to send. When there's any messsage is in queue, The `ReactRuntime` will auto send it next time when `process_events`` is called.
     /// * Note that if this function is called with a socket. the same sender should always be used to send socket messages.
     /// * `send_completion` - callback to indicate the message is sent. If there's any error, the socket will be closed and this callback is not called.
@@ -1012,15 +1043,15 @@ impl MsgSender {
         sock: &mut std::net::TcpStream,
         buf: &[u8],
         send_completion: impl Fn() + 'static,
-    ) -> SendOrQueResult {
+    ) -> Result<SendOrQueResult> {
         let mut buf = buf;
         if buf.is_empty() {
             send_completion();
-            return SendOrQueResult::Complete;
+            return Ok(SendOrQueResult::Complete);
         }
         if !self.buf.is_empty() {
             self.queue_msg(buf, send_completion);
-            return SendOrQueResult::InQueue;
+            return Ok(SendOrQueResult::InQueue);
         }
         // else try send. queue it if fails.
         let mut sentbytes = 0;
@@ -1030,13 +1061,13 @@ impl MsgSender {
                     if bytes == 0 {
                         logmsg!("[ERROR] sock 0 bytes {sock:?}. close socket");
                         self.close_or_error = true;
-                        return SendOrQueResult::CloseOrError;
+                        return Err("Peer closed.".to_owned());
                     } else if bytes < buf.len() {
                         buf = &buf[bytes..];
                         sentbytes += bytes; // retry next loop
                     } else {
                         send_completion();
-                        return SendOrQueResult::Complete; // sent
+                        return Ok(SendOrQueResult::Complete); // sent
                     }
                 }
                 std::io::Result::Err(err) => {
@@ -1046,7 +1077,7 @@ impl MsgSender {
                     } else if errkind == ErrorKind::ConnectionReset {
                         logmsg!("sock reset : {sock:?}. close socket");
                         self.close_or_error = true;
-                        return SendOrQueResult::CloseOrError;
+                        return Err("socket reset.".to_owned());
                     // socket closed
                     } else if errkind == ErrorKind::Interrupted {
                         logmsg!("[WARN] sock Interrupted : {sock:?}. retry");
@@ -1054,14 +1085,14 @@ impl MsgSender {
                     } else {
                         logmsg!("[ERROR]: write on sock {sock:?}, error: {err:?}");
                         self.close_or_error = true;
-                        return SendOrQueResult::CloseOrError;
+                        return Err("write socket error.".to_owned());
                     }
                 }
             }
         }
         //---- queue the remaining bytes
         self.queue_msg(&buf[sentbytes..], send_completion);
-        SendOrQueResult::InQueue
+        Ok(SendOrQueResult::InQueue)
     }
 
     fn queue_msg(&mut self, buf: &[u8], send_completion: impl Fn() + 'static) {
@@ -1084,36 +1115,35 @@ impl MsgSender {
 
     // This function is called ony ReactRuntime to send messages in queue.
     #[allow(unused_assignments)]
-    fn send_queued(&mut self, sock: &mut std::net::TcpStream) -> SendOrQueResult {
+    fn send_queued(&mut self, sock: &mut std::net::TcpStream) -> Result<SendOrQueResult> {
         if self.buf.is_empty() {
-            return SendOrQueResult::Complete;
+            return Ok(SendOrQueResult::Complete);
         }
         let mut sentbytes = 0;
         match sock.write(&self.buf[..]) {
             std::io::Result::Ok(bytes) => {
                 sentbytes = bytes;
                 if bytes == 0 {
-                    logmsg!("[ERROR] sock 0 bytes {sock:?}. close socket");
                     self.close_or_error = true;
-                    return SendOrQueResult::CloseOrError;
+                    return Err(format!("[ERROR] write sock 0 bytes {sock:?}. close socket"));
                 }
             }
             std::io::Result::Err(err) => {
                 let errkind = err.kind();
                 if errkind == ErrorKind::WouldBlock {
-                    return SendOrQueResult::InQueue; // queued
+                    return Ok(SendOrQueResult::InQueue); // queued
                 } else if errkind == ErrorKind::ConnectionReset {
-                    logmsg!("sock reset : {sock:?}. close socket");
                     self.close_or_error = true;
-                    return SendOrQueResult::CloseOrError;
+                    return Err(format!(
+                        "[ERROR] Write sock ConnectionReset {sock:?}. close socket"
+                    ));
                 // socket closed
                 } else if errkind == ErrorKind::Interrupted {
                     logmsg!("[WARN] sock Interrupted : {sock:?}. retry");
-                    return SendOrQueResult::InQueue; // Interrupted is not an error. queue
+                    return Ok(SendOrQueResult::InQueue); // Interrupted is not an error. queue
                 } else {
-                    logmsg!("[ERROR]: write on sock {sock:?}, error: {err:?}");
                     self.close_or_error = true;
-                    return SendOrQueResult::CloseOrError;
+                    return Err(format!("[ERROR]: write on sock {sock:?}, error: {err:?}"));
                 }
             }
         }
@@ -1156,10 +1186,10 @@ impl MsgSender {
             debug_assert_eq!(self.last_pending_id, usize::MAX);
             debug_assert_eq!(self.pending.len(), 0);
             self.bytes_sent = 0;
-            SendOrQueResult::Complete
+            Ok(SendOrQueResult::Complete)
         } else {
             self.bytes_sent += sentbytes;
-            SendOrQueResult::InQueue
+            Ok(SendOrQueResult::InQueue)
         }
     }
 }
@@ -1191,11 +1221,12 @@ impl MsgReader {
     }
 
     /// Strategy 1: fast dispatch: dispatch on each read of about min_reserve bytes.
+    /// return Err to close socket
     pub fn try_read_fast_dispatch<UserCommand>(
         &mut self,
         ctx: &mut DispatchContext<UserCommand>,
         dispatcher: &mut (impl Reactor<UserCommand = UserCommand> + ?Sized),
-    ) -> bool {
+    ) -> Result<()> {
         loop {
             debug_assert!(
                 self.decoded_msgsize == 0 || self.decoded_msgsize > self.bufsize - self.startpos
@@ -1210,19 +1241,16 @@ impl MsgReader {
             match ctx.sock.read(&mut self.recv_buffer[self.bufsize..]) {
                 std::io::Result::Ok(new_bytes) => {
                     if new_bytes == 0 {
-                        logmsg!("peer closed sock: {:?}", ctx.sock);
-                        return false;
+                        return Err(format!("peer closed sock: {:?}", ctx.sock));
                     }
                     debug_assert!(self.bufsize + new_bytes <= self.recv_buffer.len());
 
                     self.bufsize += new_bytes;
                     let should_return = self.bufsize < self.recv_buffer.len(); // not full, no need to retry this time.
 
-                    if !self.try_dispatch_all(new_bytes, ctx, dispatcher) {
-                        return false;
-                    }
+                    self.try_dispatch_all(new_bytes, ctx, dispatcher)?;
                     if should_return {
-                        return true; // not full, wait for next readable.
+                        return Ok(()); // not full, wait for next readable.
                     } else {
                         continue; // try next read.
                     }
@@ -1230,27 +1258,33 @@ impl MsgReader {
                 std::io::Result::Err(err) => {
                     let errkind = err.kind();
                     if errkind == ErrorKind::WouldBlock {
-                        return true; // wait for next readable.
+                        return Ok(()); // wait for next readable.
                     } else if errkind == ErrorKind::ConnectionReset {
-                        logmsg!("sock reset : {:?}. close socket", ctx.sock);
-                        return false; // socket closed
+                        return Err(format!("sock reset : {:?}. close socket", ctx.sock));
                     } else if errkind == ErrorKind::Interrupted {
                         logmsg!("[WARN] sock Interrupted : {:?}. retry", ctx.sock);
-                        return true; // Interrupted is not an error.
+                        return Ok(()); // Interrupted is not an error.
                     } else if errkind == ErrorKind::ConnectionAborted {
-                        logmsg!("sock ConnectionAborted : {:?}. close socket", ctx.sock); // closed by remote (windows)
-                        return false; // close socket.
+                        return Err(format!(
+                            "sock ConnectionAborted : {:?}. close socket",
+                            ctx.sock
+                        )); // closed by remote (windows)
                     }
-                    logmsg!("[ERROR]: read on sock {:?}, error: {err:?}", ctx.sock);
-                    return false;
+                    return Err(format!(
+                        "[ERROR]: read on sock {:?}, error: {err:?}",
+                        ctx.sock
+                    ));
                 }
             }
         }
     }
 
     /// Read until WOULDBLOCK.
-    /// return false if there's any error or peer closed; return true, if WouldBlock.
-    pub fn try_read_all<UserCommand>(&mut self, ctx: &mut DispatchContext<UserCommand>) -> bool {
+    /// return Err to close socket
+    pub fn try_read_all<UserCommand>(
+        &mut self,
+        ctx: &mut DispatchContext<UserCommand>,
+    ) -> Result<()> {
         loop {
             if self.bufsize + self.min_reserve > self.recv_buffer.len() {
                 self.recv_buffer.resize(
@@ -1261,57 +1295,61 @@ impl MsgReader {
             match ctx.sock.read(&mut self.recv_buffer[self.bufsize..]) {
                 std::io::Result::Ok(new_bytes) => {
                     if new_bytes == 0 {
-                        logmsg!("peer closed sock: {:?}", ctx.sock);
-                        return false;
+                        return Err(format!("peer closed sock: {:?}", ctx.sock));
                     }
                     debug_assert!(self.bufsize + new_bytes <= self.recv_buffer.len());
 
                     self.bufsize += new_bytes;
                     if self.bufsize < self.recv_buffer.len() {
                         // not full, no need to retry this time.
-                        return true;
+                        return Ok(());
                     }
                 }
                 std::io::Result::Err(err) => {
                     let errkind = err.kind();
                     if errkind == ErrorKind::WouldBlock {
-                        return true; // wait for next readable.
+                        return Ok(()); // wait for next readable.
                     } else if errkind == ErrorKind::ConnectionReset {
-                        logmsg!("sock reset : {:?}. close socket", ctx.sock);
-                        return false; // socket closed
+                        return Err(format!("sock reset : {:?}. close socket", ctx.sock));
+                    // socket closed
                     } else if errkind == ErrorKind::Interrupted {
                         logmsg!("[WARN] sock Interrupted : {:?}. retry", ctx.sock);
-                        return true; // Interrupted is not an error.
+                        return Ok(()); // Interrupted is not an error.
                     } else if errkind == ErrorKind::ConnectionAborted {
-                        logmsg!("sock ConnectionAborted : {:?}. close socket", ctx.sock); // closed by remote (windows)
-                        return false; // close socket.
+                        return Err(format!(
+                            "sock ConnectionAborted : {:?}. close socket",
+                            ctx.sock
+                        )); // closed by remote (windows)
                     }
-                    logmsg!("[ERROR]: read on sock {:?}, error: {err:?}", ctx.sock);
-                    return false;
+                    return Err(format!(
+                        "[ERROR]: read on sock {:?}, error: {err:?}",
+                        ctx.sock
+                    ));
                 }
             } // match
         } // loop
     }
 
     /// try dispatch all messages in buffer.
-    /// return false if there's any error
+    /// return Error if there's any error or close.
     pub fn try_dispatch_all<UserCommand>(
         &mut self,
         new_bytes: usize,
         ctx: &mut DispatchContext<UserCommand>,
         dispatcher: &mut (impl Reactor<UserCommand = UserCommand> + ?Sized),
-    ) -> bool {
+    ) -> Result<()> {
         let mut new_bytes = new_bytes;
         // loop while: buf_not_empty and ( partial_header or partial_msg )
         while self.startpos < self.bufsize
             && (self.decoded_msgsize == 0 || self.startpos + self.decoded_msgsize <= self.bufsize)
         {
-            match dispatcher.on_inbound_message(
+            let res = dispatcher.on_inbound_message(
                 &mut self.recv_buffer[self.startpos..self.bufsize],
                 new_bytes,
                 self.decoded_msgsize,
                 ctx,
-            ) {
+            )?;
+            match res {
                 MessageResult::ExpectMsgSize(msgsize) => {
                     if !(msgsize == 0 || msgsize > self.bufsize - self.startpos) {
                         logmsg!( "[WARN] on_inbound_message should NOT expect a msgsize while full message is already received, which may cause recursive call. msgsize:{msgsize:?} recved: {}",
@@ -1327,10 +1365,6 @@ impl MsgReader {
                     self.decoded_msgsize = 0;
                     new_bytes = self.bufsize - self.startpos;
                 }
-                MessageResult::Close => {
-                    logmsg!("Dispatch requested closing sock: {:?}. ", ctx.sock);
-                    return false;
-                }
             }
         }
         if self.startpos != 0 {
@@ -1339,7 +1373,7 @@ impl MsgReader {
             self.bufsize -= self.startpos;
             self.startpos = 0;
         }
-        true
+        Ok(())
     }
 
     /// Strategy 2: fast read: read all until WOULDBLOCK, then dispatch all.
@@ -1347,11 +1381,13 @@ impl MsgReader {
         &mut self,
         ctx: &mut DispatchContext<UserCommand>,
         dispatcher: &mut (impl Reactor<UserCommand = UserCommand> + ?Sized),
-    ) -> bool {
+    ) -> Result<()> {
         let old_bytes = self.bufsize - self.startpos;
-        let ok = self.try_read_all(ctx);
-        let ok2 = self.try_dispatch_all(self.bufsize - self.startpos - old_bytes, ctx, dispatcher);
-        ok && ok2
+        let res = self.try_read_all(ctx);
+        let res2 = self.try_dispatch_all(self.bufsize - self.startpos - old_bytes, ctx, dispatcher);
+        res?;
+        res2?;
+        Ok(())
     }
 }
 
@@ -1408,7 +1444,6 @@ impl<NewReactor: NewServerReactor + 'static> TcpListenerHandler
         &mut self,
         _conn: &mut std::net::TcpListener,
         _new_conn: &mut std::net::TcpStream,
-        _addr: std::net::SocketAddr,
     ) -> Option<NewStreamConnection<Self::UserCommand>> {
         self.count_children += 1;
         Some(NewStreamConnection {
@@ -1420,6 +1455,158 @@ impl<NewReactor: NewServerReactor + 'static> TcpListenerHandler
         })
     }
 }
+
+//====================================================================================
+//            SimpleIoReactor, SimpleIoListener, CommandReactor
+//====================================================================================
+
+pub type SimpleIoRuntime = ReactRuntime<()>;
+pub type SimpleIoReactorContext<'a> = DispatchContext<'a, ()>;
+
+type NewConnectionHandler = dyn FnMut(
+    &mut SimpleIoReactorContext<'_>,
+    ReactorID, // parent listener reactorid.
+) -> Result<()>;
+
+type CloseHandler = dyn FnMut(ReactorID, &CmdSender<()>);
+
+type SockMsgHandler = dyn FnMut(&mut [u8], &mut SimpleIoReactorContext<'_>) -> Result<usize>;
+
+type CmdHandler<UserCommand> =
+    dyn FnMut(UserCommand, &mut DispatchContext<'_, UserCommand>) -> Result<()>;
+
+/// `SimpleIoReactor` doesn't have `UserCommand`. User supplies a callback function to handle inbound socket messages.
+/// On each readable socket event, the MsgReader reads all data and call msg_handler to dispatch message. The framework
+/// will drop all message after msg_handler returns.
+///
+/// **Note that SimpleIoReactor can only be used with SimpleIoRuntime
+pub struct SimpleIoReactor {
+    new_connection_handler: Option<Box<NewConnectionHandler>>,
+    close_handler: Option<Box<CloseHandler>>,
+    /// msg_handler returns Err to close socket. else, returns Ok(dropMsgSize);
+    msg_handler: Box<SockMsgHandler>,
+}
+impl SimpleIoReactor {
+    pub fn new(
+        new_connection_handler: Option<Box<NewConnectionHandler>>,
+        close_handler: Option<Box<CloseHandler>>,
+        msg_handler: impl FnMut(&mut [u8], &mut SimpleIoReactorContext<'_>) -> Result<usize> + 'static,
+    ) -> Self {
+        Self {
+            new_connection_handler,
+            close_handler,
+            msg_handler: Box::new(msg_handler),
+        }
+    }
+}
+impl Reactor for SimpleIoReactor {
+    type UserCommand = ();
+
+    fn on_inbound_message(
+        &mut self,
+        buf: &mut [u8],
+        _new_bytes: usize,
+        _decoded_msg_size: usize,
+        ctx: &mut DispatchContext<Self::UserCommand>,
+    ) -> Result<MessageResult> {
+        let drop_msg_size = (self.msg_handler)(buf, ctx)?;
+        Ok(MessageResult::DropMsgSize(drop_msg_size)) // drop all all messages.
+    }
+    fn on_connected(
+        &mut self,
+        ctx: &mut DispatchContext<Self::UserCommand>,
+        listener: ReactorID,
+    ) -> Result<()> {
+        if let Some(ref mut h) = self.new_connection_handler {
+            return (h)(ctx, listener);
+        }
+        Ok(()) // accept the connection by default.
+    }
+    fn on_close(&mut self, reactorid: ReactorID, cmd_sender: &CmdSender<Self::UserCommand>) {
+        if let Some(ref mut h) = self.close_handler {
+            (h)(reactorid, cmd_sender)
+        }
+    }
+}
+
+/// `SimpleIoListener` implements TcpListenerHandler. It creates SimpleIoReactor using user specified handler.
+struct SimpleIoListener {
+    count_children: usize,
+    reactorid: ReactorID,
+    recv_buffer_min_size: usize,
+    reactor_creator: Box<dyn FnMut(usize) -> Option<SimpleIoReactor>>, // call reactor_creator(children_count) to create SimpleIoReactor
+}
+impl SimpleIoListener {
+    pub fn new(
+        recv_buffer_min_size: usize,
+        reactor_creator: impl FnMut(usize) -> Option<SimpleIoReactor> + 'static,
+    ) -> Self {
+        Self {
+            count_children: 0,
+            reactorid: INVALID_REACTOR_ID,
+            recv_buffer_min_size,
+            reactor_creator: Box::new(reactor_creator),
+        }
+    }
+}
+impl TcpListenerHandler for SimpleIoListener {
+    type UserCommand = ();
+
+    fn on_start_listen(
+        &mut self,
+        reactorid: ReactorID,
+        _cmd_sender: &CmdSender<Self::UserCommand>,
+    ) {
+        self.reactorid = reactorid;
+    }
+    fn on_new_connection(
+        &mut self,
+        _conn: &mut std::net::TcpListener,
+        _new_conn: &mut std::net::TcpStream,
+    ) -> Option<NewStreamConnection<Self::UserCommand>> {
+        self.count_children += 1;
+        (self.reactor_creator)(self.count_children).map(|reactor| NewStreamConnection {
+            reactor: Box::new(reactor),
+            recv_buffer_min_size: self.recv_buffer_min_size,
+        })
+    }
+}
+
+/// `CommandReactor` doesn't have associated sockets, so only receives commands.
+pub struct CommandReactor<UserCommand> {
+    cmd_handler: Box<CmdHandler<UserCommand>>,
+}
+impl<UserCommand> CommandReactor<UserCommand> {
+    pub fn new(
+        cmd_handler: impl FnMut(UserCommand, &mut DispatchContext<'_, UserCommand>) -> Result<()>
+            + 'static,
+    ) -> Self {
+        Self {
+            cmd_handler: Box::new(cmd_handler),
+        }
+    }
+}
+impl<UserCommand> Reactor for CommandReactor<UserCommand> {
+    type UserCommand = UserCommand;
+
+    fn on_inbound_message(
+        &mut self,
+        _buf: &mut [u8],
+        _new_bytes: usize,
+        _decoded_msg_size: usize,
+        _ctx: &mut DispatchContext<Self::UserCommand>,
+    ) -> Result<MessageResult> {
+        panic!("CommandReactor should not have any associated sockets.");
+    }
+    fn on_command(
+        &mut self,
+        cmd: Self::UserCommand,
+        ctx: &mut DispatchContext<Self::UserCommand>,
+    ) -> Result<()> {
+        (self.cmd_handler)(cmd, ctx)
+    }
+}
+
 //====================================================================================
 //            example: MyReactor
 //====================================================================================
@@ -1429,8 +1616,28 @@ pub mod example {
 
     #[derive(Copy, Clone)]
     pub struct MsgHeader {
-        body_len: u16,  // 2 bytes
-        send_time: i64, // 8 bytes, sending timestamp nanos since epoch
+        pub body_len: u16,  // 2 bytes
+        pub send_time: i64, // 8 bytes, sending timestamp nanos since epoch
+    }
+    pub struct Msg {
+        pub header: MsgHeader,
+        pub payload: Vec<u8>,
+    }
+    impl Default for Msg {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+    impl Msg {
+        pub fn new() -> Self {
+            Self {
+                header: MsgHeader {
+                    body_len: 0,
+                    send_time: 0,
+                },
+                payload: Vec::new(),
+            }
+        }
     }
     const MSG_HEADER_SIZE: usize = 10;
     const LATENCY_BATCH_SIZE: i32 = 10000;
@@ -1450,6 +1657,8 @@ pub mod example {
         pub last_sent_time: i64,
         pub single_trip_durations: Vec<i64>,
         pub round_trip_durations: Vec<i64>,
+
+        pub last_recv_msg: Msg, // used to verify.
     }
     impl Default for MyReactor {
         fn default() -> Self {
@@ -1459,26 +1668,30 @@ pub mod example {
     impl Reactor for MyReactor {
         type UserCommand = MyUserCommand;
 
-        fn on_command(&mut self, cmd: MyUserCommand, ctx: &mut DispatchContext<MyUserCommand>) {
+        fn on_command(
+            &mut self,
+            cmd: MyUserCommand,
+            ctx: &mut DispatchContext<MyUserCommand>,
+        ) -> Result<()> {
             logmsg!("Reactorid {} recv cmd: {}", ctx.reactorid, cmd);
+            Ok(())
         }
 
         fn on_connected(
             &mut self,
             ctx: &mut DispatchContext<MyUserCommand>,
             listener: ReactorID,
-        ) -> bool {
+        ) -> Result<()> {
             self.parent_listener = listener;
             logmsg!("[{}] sock connected: {:?}", self.name, ctx.sock);
             if self.is_client {
-                self.send_msg(ctx, "test msg000");
+                self.send_msg(ctx, "test msg000")?;
             } else {
                 // if it's not client. close parent listener socket.
                 ctx.cmd_sender
-                    .send_close(listener, Deferred::Immediate, |_| {})
-                    .unwrap();
+                    .send_close(listener, Deferred::Immediate, |_| {})?;
             }
-            true
+            Ok(())
         }
 
         fn on_inbound_message(
@@ -1487,37 +1700,42 @@ pub mod example {
             _new_bytes: usize,
             decoded_msg_size: usize,
             ctx: &mut DispatchContext<Self::UserCommand>,
-        ) -> MessageResult {
+        ) -> Result<MessageResult> {
             let mut msg_size = decoded_msg_size;
             if msg_size == 0 {
                 // decode header
                 if buf.len() < MSG_HEADER_SIZE {
-                    return MessageResult::ExpectMsgSize(0); // partial header
+                    return Ok(MessageResult::ExpectMsgSize(0)); // partial header
                 }
                 let header_bodylen: &u16 = utils::bytes_to_ref(&buf[0..MSG_HEADER_SIZE]);
                 msg_size = *header_bodylen as usize + MSG_HEADER_SIZE;
 
                 if msg_size > buf.len() {
-                    return MessageResult::ExpectMsgSize(msg_size); // decoded msg_size but still partial msg. need reading more.
+                    return Ok(MessageResult::ExpectMsgSize(msg_size)); // decoded msg_size but still partial msg. need reading more.
                 } // else having read full msg. should NOT return. continue processing.
             }
             debug_assert!(buf.len() >= msg_size); // full msg.
                                                   //---- process full message.
             let recvtime = utils::cpu_now_nanos();
             {
-                let header_bodylen: &u16 = utils::bytes_to_ref(&buf[0..MSG_HEADER_SIZE]);
-                let header_sendtime: &i64 = utils::bytes_to_ref(&buf[2..MSG_HEADER_SIZE]);
-                debug_assert_eq!(*header_bodylen as usize + MSG_HEADER_SIZE, buf.len());
+                self.last_recv_msg.header.body_len = *utils::bytes_to_ref(&buf[0..MSG_HEADER_SIZE]);
+                self.last_recv_msg.header.send_time =
+                    *utils::bytes_to_ref(&buf[2..MSG_HEADER_SIZE]);
+                debug_assert_eq!(
+                    self.last_recv_msg.header.body_len as usize + MSG_HEADER_SIZE,
+                    buf.len()
+                );
 
                 if self.last_sent_time > 0 {
                     self.round_trip_durations
                         .push(recvtime - self.last_sent_time);
-                    self.single_trip_durations.push(recvtime - *header_sendtime);
+                    self.single_trip_durations
+                        .push(recvtime - self.last_recv_msg.header.send_time);
                     dbglog!(
                         "Recv msg sock: {:?} [{}, {}, {}] content: {} <{}>",
                         ctx.sock,
                         self.last_sent_time,
-                        *header_sendtime,
+                        self.last_recv_msg.header.send_time,
                         recvtime,
                         buf.len(),
                         std::str::from_utf8(&buf[MSG_HEADER_SIZE..]).unwrap()
@@ -1532,16 +1750,20 @@ pub mod example {
 
             if self.count_echo < self.max_echo {
                 self.last_sent_time = utils::cpu_now_nanos();
-                if SendOrQueResult::CloseOrError
-                    == ctx.sender.send_or_que(ctx.sock, &buf[..msg_size], || {})
-                {
-                    return MessageResult::Close;
-                }
+                ctx.sender.send_or_que(ctx.sock, &buf[..msg_size], || {})?;
 
+                self.last_recv_msg.payload.clear();
+                self.last_recv_msg
+                    .payload
+                    .extend_from_slice(&buf[MSG_HEADER_SIZE..]);
                 self.count_echo += 1;
-                MessageResult::DropMsgSize(msg_size)
+                Ok(MessageResult::DropMsgSize(msg_size))
             } else {
-                MessageResult::Close
+                self.last_recv_msg.payload.clear();
+                self.last_recv_msg
+                    .payload
+                    .extend_from_slice(&buf[MSG_HEADER_SIZE..]);
+                Err("Reached max echo. close.".to_owned())
             }
         }
     }
@@ -1578,6 +1800,7 @@ pub mod example {
                 last_sent_time: 0,
                 single_trip_durations: Vec::new(),
                 round_trip_durations: Vec::new(),
+                last_recv_msg: Msg::new(),
             }
         }
 
@@ -1586,7 +1809,11 @@ pub mod example {
         }
 
         /// Used to send initial message.
-        pub fn send_msg(&mut self, ctx: &mut DispatchContext<MyUserCommand>, msg: &str) -> bool {
+        pub fn send_msg(
+            &mut self,
+            ctx: &mut DispatchContext<MyUserCommand>,
+            msg: &str,
+        ) -> Result<()> {
             let mut buf = vec![0u8; msg.len() + MSG_HEADER_SIZE];
 
             buf[MSG_HEADER_SIZE..(MSG_HEADER_SIZE + msg.len())].copy_from_slice(msg.as_bytes());
@@ -1601,11 +1828,9 @@ pub mod example {
                 *header_sendtime = utils::cpu_now_nanos();
             }
 
-            //
-            let res =
-                ctx.sender
-                    .send_or_que(ctx.sock, &buf[..(msg.len() + MSG_HEADER_SIZE)], || {});
-            res != SendOrQueResult::CloseOrError
+            ctx.sender
+                .send_or_que(ctx.sock, &buf[..(msg.len() + MSG_HEADER_SIZE)], || {})?;
+            Ok(())
         }
     }
 
@@ -1634,7 +1859,8 @@ mod test {
     use example::ServerParam;
 
     #[test]
-    pub fn test_reactors_cmd() {
+    // MyReactor is a Reactor to send back any received messages, which could be used to test round-trip TCP time.
+    pub fn test_ping_pong_myreactor() {
         let addr = "127.0.0.1:12355";
         let recv_buffer_min_size = 1024;
         let mut runtime = ReactRuntime::new();
@@ -1645,8 +1871,8 @@ mod test {
                 DefaultTcpListenerHandler::<example::MyReactor>::new(
                     recv_buffer_min_size,
                     ServerParam {
-                        name: "server".to_owned(),
-                        latency_batch: 1000,
+                        name: "server".to_owned(), // parent/listner reactor name. Children names are appended a count number. E.g. "Server-1" for the first connection.
+                        latency_batch: 1000, // report round-trip time for each latency_batch samples.
                     },
                 ),
                 Deferred::Immediate,
@@ -1657,13 +1883,81 @@ mod test {
             .send_connect(
                 addr,
                 recv_buffer_min_size,
+                // client MyReactor initiate a message. It sends echo back 2 messages before close and latency_batch=1000.
                 example::MyReactor::new_client("client".to_owned(), 2, 1000),
                 Deferred::Immediate,
                 |_| {},
             )
             .unwrap();
-        // In single threaded environment, process_events until there're no reactors, no events, no deferred events.
+        // In non-threaded environment, process_events until there're no reactors, no events, no deferred events.
         while runtime.process_events() {}
         assert_eq!(runtime.count_reactors(), 0);
+        assert_eq!(runtime.count_deferred_queue(), 0);
+    }
+
+    #[test]
+    pub fn test_io_reactor() {
+        let addr = "127.0.0.1:12355";
+        let recv_buffer_min_size = 1024;
+        let mut runtime = SimpleIoRuntime::new();
+        let max_echos = 1;
+        let mut count_echos = 0;
+        let echo_reactor = move |buf: &mut [u8], ctx: &mut SimpleIoReactorContext<'_>| {
+            if count_echos >= max_echos {
+                return Err(format!("Reached max echo: {max_echos}")); // close socket
+            }
+            ctx.sender
+                .send_or_que(ctx.sock, "hello".as_bytes(), || {})?;
+            count_echos += 1;
+            Ok(buf.len())
+        };
+        let echo_server = echo_reactor;
+
+        //-- server
+        runtime
+            .get_cmd_sender()
+            .send_listen(
+                addr,
+                SimpleIoListener::new(recv_buffer_min_size, move |_childid| {
+                    Some(SimpleIoReactor::new(
+                        Some(Box::new(|ctx, listenerid| {
+                            ctx.cmd_sender
+                                .send_close(listenerid, Deferred::Immediate, |_| {})?; // close parent listerner.
+                            Ok(()) // accept current connection.
+                        })),
+                        None, // no close handler
+                        echo_server,
+                    ))
+                }),
+                Deferred::Immediate,
+                |_| {},
+            )
+            .unwrap();
+        while runtime.count_reactors() < 1 {
+            runtime.process_events();
+        }
+        //-- client
+        runtime
+            .get_cmd_sender()
+            .send_connect(
+                addr,
+                recv_buffer_min_size,
+                SimpleIoReactor::new(
+                    Some(Box::new(|ctx, _| {
+                        ctx.sender
+                            .send_or_que(ctx.sock, "Hello".as_bytes(), || {})?;
+                        Ok(()) // accept connection
+                    })),
+                    None, // no close handler
+                    echo_reactor,
+                ),
+                Deferred::Immediate,
+                |_| {},
+            )
+            .unwrap();
+        // In non-threaded environment, process_events until there're no reactors, no events, no deferred events.
+        while runtime.process_events() {}
+        assert_eq!(runtime.count_reactors(), 0);
+        assert_eq!(runtime.count_deferred_queue(), 0);
     }
 }
