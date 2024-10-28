@@ -1,8 +1,10 @@
+# Version 0.1.4
+- Two stage AutoSendBuffer: write messages to send_buf and auto send on drop.
+- TODO: support non-socket reactors.
+
 # Version 0.1.3
 - Support Result<_, String>. return Err to close reactor.
 - Add SimpleIoReactor, SimpleIoListener, CommandReactor.
-- TODO: two stage MsgSender: write messages to send_buf and send finnally.
-- TODO: support non-socket reactors.
 
 # Version 0.1.2
 - configurable recv_buffer_min_size for MsgReader.

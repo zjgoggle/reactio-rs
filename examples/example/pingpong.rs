@@ -252,7 +252,7 @@ mod test {
                 DefaultTcpListenerHandler::<PingpongReactor>::new(
                     recv_buffer_min_size,
                     ServerParam {
-                        name: "server".to_owned(), // parent/listner reactor name. Children names are appended a count number. E.g. "Server-1" for the first connection.
+                        name: "server".to_owned(), // parent/listener reactor name. Children names are appended a count number. E.g. "Server-1" for the first connection.
                         latency_batch: 1000, // report round-trip time for each latency_batch samples.
                     },
                 ),

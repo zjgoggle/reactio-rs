@@ -114,7 +114,13 @@ pub fn test_io_reactor() {
     };
 
     let on_client_connected = |ctx: &mut reactio::SimpleIoReactorContext<'_>, _| {
-        ctx.send_msg("Hello".as_bytes())?; // client sends initial msg.
+        // client sends initial msg.
+        let mut auto_sender = ctx.acquire_send(); // send on drop
+        auto_sender.write_fmt(format_args!("test ")).unwrap();
+        auto_sender.write_fmt(format_args!("msgsend")).unwrap();
+        assert_eq!(auto_sender.count_written(), 12);
+        // auto_sender.send(None).unwrap(); // this line can be omitted to let it auto send on drop.
+        // ctx.send_msg("Hello".as_bytes())?; // rather than using auto_sender, we call ctx to send_msg
         Ok(()) // accept connection
     };
 

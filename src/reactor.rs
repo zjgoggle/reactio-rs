@@ -103,6 +103,14 @@ impl<'a, UserCommand> DispatchContext<'a, UserCommand> {
     pub fn send_msg(&mut self, msg: &[u8]) -> Result<SendOrQueResult> {
         self.sender.send_or_que(self.sock, msg, None)
     }
+    pub fn acquire_send(&mut self) -> AutoSendBuffer<'_> {
+        let old_buf_size = self.sender.buf.len();
+        AutoSendBuffer {
+            sender: self.sender,
+            sock: self.sock,
+            old_buf_size,
+        }
+    }
 }
 
 /// `MessageResult` is returned by `on_inbound_message` to indicate result.
@@ -687,7 +695,7 @@ impl<UserCommand> ReactRuntime<UserCommand> {
                                 dbglog!("WARN: unsolicited writable sock: {:?}", ctx.sock);
                             }
                             ctx.interested_writable = true; // in case unsolicited event.
-                            if !ctx.sender.pending.is_empty() {
+                            if !ctx.sender.buf.is_empty() {
                                 if let Err(err) = ctx.sender.send_queued(&mut ctx.sock) {
                                     logmsg!("{err}  send_queued failed.");
                                     removesock = true;
@@ -710,7 +718,7 @@ impl<UserCommand> ReactRuntime<UserCommand> {
                         }
                         // add or remove write interest
                         if !removesock {
-                            if !ctx.interested_writable && !ctx.sender.pending.is_empty() {
+                            if !ctx.interested_writable && !ctx.sender.buf.is_empty() {
                                 self.mgr
                                     .poller
                                     .modify_with_mode(
@@ -720,7 +728,7 @@ impl<UserCommand> ReactRuntime<UserCommand> {
                                     )
                                     .unwrap();
                                 ctx.interested_writable = true;
-                            } else if ctx.interested_writable && ctx.sender.pending.is_empty() {
+                            } else if ctx.interested_writable && ctx.sender.buf.is_empty() {
                                 self.mgr
                                     .poller
                                     .modify_with_mode(
@@ -1033,11 +1041,42 @@ impl MsgSender {
             close_or_error: false,
         }
     }
-    // TODO: two stage send: acquire SendBuffer, append multiple messages to buffer; then send.
-    pub fn acquire_send_buffer(&mut self, request_nbytes: usize) -> AcquiredSendBuffer<'_> {
-        AcquiredSendBuffer {
-            sender: self,
-            request_nbytes,
+
+    // try send until Err, WOULDBLOCK or Complete.
+    // return <bytes_sent, errMsg>
+    pub fn try_send_all(sock: &mut std::net::TcpStream, buf: &[u8]) -> (usize, String) {
+        let mut buf = buf;
+        let mut sentbytes = 0;
+        loop {
+            match sock.write(buf) {
+                std::io::Result::Ok(bytes) => {
+                    if bytes == 0 {
+                        logmsg!("[ERROR] sock 0 bytes {sock:?}. close socket");
+                        return (sentbytes, "Peer closed.".to_owned());
+                    } else if bytes < buf.len() {
+                        buf = &buf[bytes..];
+                        sentbytes += bytes; // retry next loop
+                    } else {
+                        return (sentbytes + bytes, String::new()); // sent
+                    }
+                }
+                std::io::Result::Err(err) => {
+                    let errkind = err.kind();
+                    if errkind == ErrorKind::WouldBlock {
+                        return (sentbytes, String::new()); // queued
+                    } else if errkind == ErrorKind::ConnectionReset {
+                        logmsg!("sock reset : {sock:?}. close socket");
+                        return (sentbytes, "socket reset.".to_owned());
+                    // socket closed
+                    } else if errkind == ErrorKind::Interrupted {
+                        logmsg!("[WARN] sock Interrupted : {sock:?}. retry");
+                        return (sentbytes, String::new()); // Interrupted is not an error. queue
+                    } else {
+                        logmsg!("[ERROR]: write on sock {sock:?}, error: {err:?}");
+                        return (sentbytes, "write socket error.".to_owned());
+                    }
+                }
+            }
         }
     }
 
@@ -1050,7 +1089,7 @@ impl MsgSender {
         buf: &[u8],
         send_completion: Option<Box<dyn FnOnce()>>,
     ) -> Result<SendOrQueResult> {
-        let mut buf = buf;
+        // let mut buf = buf;
         if buf.is_empty() {
             if let Some(callback) = send_completion {
                 (callback)();
@@ -1058,61 +1097,45 @@ impl MsgSender {
             return Ok(SendOrQueResult::Complete);
         }
         if !self.buf.is_empty() {
-            self.queue_msg(buf, send_completion);
+            self.buf.extend_from_slice(buf);
+            self.queue_msg_completion(buf.len(), send_completion);
             return Ok(SendOrQueResult::InQueue);
         }
-        // else try send. queue it if fails.
-        let mut sentbytes = 0;
-        loop {
-            match sock.write(buf) {
-                std::io::Result::Ok(bytes) => {
-                    if bytes == 0 {
-                        logmsg!("[ERROR] sock 0 bytes {sock:?}. close socket");
-                        self.close_or_error = true;
-                        return Err("Peer closed.".to_owned());
-                    } else if bytes < buf.len() {
-                        buf = &buf[bytes..];
-                        sentbytes += bytes; // retry next loop
-                    } else {
-                        if let Some(callback) = send_completion {
-                            (callback)();
-                        }
-                        return Ok(SendOrQueResult::Complete); // sent
-                    }
-                }
-                std::io::Result::Err(err) => {
-                    let errkind = err.kind();
-                    if errkind == ErrorKind::WouldBlock {
-                        break; // queued
-                    } else if errkind == ErrorKind::ConnectionReset {
-                        logmsg!("sock reset : {sock:?}. close socket");
-                        self.close_or_error = true;
-                        return Err("socket reset.".to_owned());
-                    // socket closed
-                    } else if errkind == ErrorKind::Interrupted {
-                        logmsg!("[WARN] sock Interrupted : {sock:?}. retry");
-                        break; // Interrupted is not an error. queue
-                    } else {
-                        logmsg!("[ERROR]: write on sock {sock:?}, error: {err:?}");
-                        self.close_or_error = true;
-                        return Err("write socket error.".to_owned());
-                    }
-                }
+        // else sendbuf is empty.  try send. queue it if fails.
+        debug_assert_eq!(self.bytes_sent, 0);
+        debug_assert_eq!(self.first_pending_id, usize::MAX);
+        debug_assert_eq!(self.last_pending_id, usize::MAX);
+        debug_assert_eq!(self.pending.len(), 0);
+
+        let (sentbytes, err) = MsgSender::try_send_all(sock, buf);
+        if !err.is_empty() {
+            return Err(err);
+        }
+        if sentbytes == buf.len() {
+            if let Some(callback) = send_completion {
+                (callback)();
             }
+            return Ok(SendOrQueResult::Complete); // sent
         }
         //---- queue the remaining bytes
-        self.queue_msg(&buf[sentbytes..], send_completion);
+        self.buf.extend_from_slice(&buf[sentbytes..]);
+        self.queue_msg_completion(buf.len() - sentbytes, send_completion);
         Ok(SendOrQueResult::InQueue)
     }
 
-    fn queue_msg(&mut self, buf: &[u8], send_completion: Option<Box<dyn FnOnce()>>) {
+    // call this function after message has been appened to self.buf.
+    fn queue_msg_completion(
+        &mut self,
+        queued_size: usize,
+        send_completion: Option<Box<dyn FnOnce()>>,
+    ) {
         if let Some(callback) = send_completion {
             // append to last.
             let prev_id = self.last_pending_id;
             self.last_pending_id = self.pending.add(PendingSend {
                 next_id: usize::MAX,
-                startpos: self.bytes_sent + self.buf.len(),
-                msgsize: buf.len(),
+                startpos: self.bytes_sent + self.buf.len() - queued_size,
+                msgsize: queued_size,
                 completion: callback,
             });
             if let Some(prev) = self.pending.get_mut(prev_id) {
@@ -1123,7 +1146,6 @@ impl MsgSender {
                 self.first_pending_id = self.last_pending_id;
             }
         }
-        self.buf.extend_from_slice(buf);
     }
 
     // This function is called ony ReactRuntime to send messages in queue.
@@ -1189,6 +1211,10 @@ impl MsgSender {
             // removed the last
             self.last_pending_id = usize::MAX;
         }
+        Ok(self.move_buf_front_after_send(sentbytes))
+    }
+    // return SendOrQueResult::Complete or InQueue
+    fn move_buf_front_after_send(&mut self, sentbytes: usize) -> SendOrQueResult {
         //- move front buf
         let len = self.buf.len();
         self.buf.copy_within(sentbytes..len, 0);
@@ -1199,17 +1225,79 @@ impl MsgSender {
             debug_assert_eq!(self.last_pending_id, usize::MAX);
             debug_assert_eq!(self.pending.len(), 0);
             self.bytes_sent = 0;
-            Ok(SendOrQueResult::Complete)
+            SendOrQueResult::Complete
         } else {
             self.bytes_sent += sentbytes;
-            Ok(SendOrQueResult::InQueue)
+            SendOrQueResult::InQueue
         }
     }
 }
 
-pub struct AcquiredSendBuffer<'sender> {
+pub struct AutoSendBuffer<'sender> {
     sender: &'sender mut MsgSender,
-    request_nbytes: usize,
+    sock: &'sender mut std::net::TcpStream,
+    old_buf_size: usize,
+}
+impl<'sender> AutoSendBuffer<'sender> {
+    // clear all unsent bytes.
+    pub fn clear(&mut self) {
+        self.sender.buf.resize(self.old_buf_size, 0);
+    }
+    pub fn count_written(&self) -> usize {
+        self.sender.buf.len() - self.old_buf_size
+    }
+    pub fn send(&mut self, send_completion: Option<Box<dyn FnOnce()>>) -> Result<SendOrQueResult> {
+        let buf = &self.sender.buf[self.old_buf_size..];
+        if buf.is_empty() {
+            if let Some(callback) = send_completion {
+                (callback)();
+            }
+            return Ok(SendOrQueResult::Complete);
+        }
+        if self.old_buf_size > 0 {
+            self.sender.queue_msg_completion(buf.len(), send_completion);
+            return Ok(SendOrQueResult::InQueue);
+        }
+
+        let (sentbytes, err) = MsgSender::try_send_all(self.sock, buf);
+        if !err.is_empty() {
+            return Err(err);
+        }
+        if sentbytes == buf.len() {
+            if let Some(callback) = send_completion {
+                (callback)();
+            }
+            return Ok(SendOrQueResult::Complete); // sent
+        }
+        //---- queue the remaining bytes
+        self.sender.move_buf_front_after_send(sentbytes);
+        self.sender
+            .queue_msg_completion(self.sender.buf.len(), send_completion);
+        Ok(SendOrQueResult::InQueue)
+    }
+}
+impl<'sender> Drop for AutoSendBuffer<'sender> {
+    fn drop(&mut self) {
+        self.send(None).unwrap(); // send on drop
+    }
+}
+impl<'sender> std::fmt::Write for AutoSendBuffer<'sender> {
+    fn write_str(&mut self, s: &str) -> std::fmt::Result {
+        self.sender.buf.extend_from_slice(s.as_bytes());
+        Ok(())
+    }
+    // fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+    //     self.sender.buf.extend_from_slice(buf);
+    //     Ok(buf.len())
+    // }
+    // fn flush(&mut self) -> std::io::Result<()> {
+    //     if self.sender.buf.len() > self.old_buf_size {
+    //         if let Err(err) = self.send(None) {
+    //             Err()
+    //         }
+    //     }
+    //     Ok(())
+    // }
 }
 
 //====================================================================================
