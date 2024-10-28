@@ -114,8 +114,7 @@ pub fn test_io_reactor() {
     };
 
     let on_client_connected = |ctx: &mut reactio::SimpleIoReactorContext<'_>, _| {
-        ctx.sender
-            .send_or_que(ctx.sock, "Hello".as_bytes(), || {})?; // client sends initial msg.
+        ctx.send_msg("Hello".as_bytes())?; // client sends initial msg.
         Ok(()) // accept connection
     };
 

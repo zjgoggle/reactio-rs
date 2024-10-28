@@ -101,7 +101,7 @@ impl<'a, UserCommand> DispatchContext<'a, UserCommand> {
         }
     }
     pub fn send_msg(&mut self, msg: &[u8]) -> Result<SendOrQueResult> {
-        self.sender.send_or_que(self.sock, msg, || {})
+        self.sender.send_or_que(self.sock, msg, None)
     }
 }
 
@@ -995,21 +995,21 @@ unsafe impl<UserCommand> Send for CmdData<UserCommand> {}
 /// Mixed using of both may cause out-of-order messages.
 pub struct MsgSender {
     pub buf: Vec<u8>,
-    pub pending: FlatStorage<PendingSend>,
-    first_pending_id: usize, // the id in flat_storage, usize::MAX is invalid
-    last_pending_id: usize,  // the id in flat_storage, usize::MAX is invalid
+    pub pending: FlatStorage<PendingSend>, // Each PendingSend represents a send_msg action.
+    first_pending_id: usize, // the id in flat_storage, usize::MAX is invalid. pop from front.
+    last_pending_id: usize,  // the id in flat_storage, usize::MAX is invalid. push to back.
     pub bytes_sent: usize,   // total bytes having been sent. buf[0] is bytes_sent+1 byte to send.
     close_or_error: bool,
 }
 /// Used to save the pending Send action.
 pub struct PendingSend {
-    next_id: usize,  // the id in flat_storage
+    next_id: usize, // the id in flat_storage. LinkNode of PendingSend saved in MsgSender::pending.
     startpos: usize, // the first byte of message to sent in buf,
     msgsize: usize,
     completion: Box<dyn FnOnce()>, // notify write completion.
 }
 
-/// `SendOrQueResult` is the result of `MsgSender::send_or_que`.
+/// `SendOrQueResult` is the result of `MsgSender::send_or_que` or `DispatchContext::send_msg`.
 #[derive(PartialEq, Eq)]
 pub enum SendOrQueResult {
     /// No message in queue
@@ -1034,6 +1034,12 @@ impl MsgSender {
         }
     }
     // TODO: two stage send: acquire SendBuffer, append multiple messages to buffer; then send.
+    pub fn acquire_send_buffer(&mut self, request_nbytes: usize) -> AcquiredSendBuffer<'_> {
+        AcquiredSendBuffer {
+            sender: self,
+            request_nbytes,
+        }
+    }
 
     /// Send the message or queue it if unabe to send. When there's any messsage is in queue, The `ReactRuntime` will auto send it next time when `process_events`` is called.
     /// * Note that if this function is called with a socket. the same sender should always be used to send socket messages.
@@ -1042,11 +1048,13 @@ impl MsgSender {
         &mut self,
         sock: &mut std::net::TcpStream,
         buf: &[u8],
-        send_completion: impl Fn() + 'static,
+        send_completion: Option<Box<dyn FnOnce()>>,
     ) -> Result<SendOrQueResult> {
         let mut buf = buf;
         if buf.is_empty() {
-            send_completion();
+            if let Some(callback) = send_completion {
+                (callback)();
+            }
             return Ok(SendOrQueResult::Complete);
         }
         if !self.buf.is_empty() {
@@ -1066,7 +1074,9 @@ impl MsgSender {
                         buf = &buf[bytes..];
                         sentbytes += bytes; // retry next loop
                     } else {
-                        send_completion();
+                        if let Some(callback) = send_completion {
+                            (callback)();
+                        }
                         return Ok(SendOrQueResult::Complete); // sent
                     }
                 }
@@ -1095,20 +1105,23 @@ impl MsgSender {
         Ok(SendOrQueResult::InQueue)
     }
 
-    fn queue_msg(&mut self, buf: &[u8], send_completion: impl Fn() + 'static) {
-        let prev_id = self.last_pending_id;
-        self.last_pending_id = self.pending.add(PendingSend {
-            next_id: usize::MAX,
-            startpos: self.bytes_sent + self.buf.len(),
-            msgsize: buf.len(),
-            completion: Box::new(send_completion),
-        });
-        if let Some(prev) = self.pending.get_mut(prev_id) {
-            prev.next_id = self.last_pending_id;
-        }
-        if self.first_pending_id == usize::MAX {
-            // add the first one
-            self.first_pending_id = self.last_pending_id;
+    fn queue_msg(&mut self, buf: &[u8], send_completion: Option<Box<dyn FnOnce()>>) {
+        if let Some(callback) = send_completion {
+            // append to last.
+            let prev_id = self.last_pending_id;
+            self.last_pending_id = self.pending.add(PendingSend {
+                next_id: usize::MAX,
+                startpos: self.bytes_sent + self.buf.len(),
+                msgsize: buf.len(),
+                completion: callback,
+            });
+            if let Some(prev) = self.pending.get_mut(prev_id) {
+                prev.next_id = self.last_pending_id;
+            }
+            if self.first_pending_id == usize::MAX {
+                // add the first one
+                self.first_pending_id = self.last_pending_id;
+            }
         }
         self.buf.extend_from_slice(buf);
     }
@@ -1147,7 +1160,7 @@ impl MsgSender {
                 }
             }
         }
-        //-- now sent some bytes. notify
+        //-- now sent some bytes. pop pending list and notify.
         while self.first_pending_id != usize::MAX {
             let id = self.first_pending_id;
             let (mut sent, mut next_id) = (false, 0);
@@ -1181,7 +1194,7 @@ impl MsgSender {
         self.buf.copy_within(sentbytes..len, 0);
         self.buf.resize(self.buf.len() - sentbytes, 0);
         if self.buf.is_empty() {
-            // reset members
+            // reset members if buf is empty.
             debug_assert_eq!(self.first_pending_id, usize::MAX);
             debug_assert_eq!(self.last_pending_id, usize::MAX);
             debug_assert_eq!(self.pending.len(), 0);
@@ -1192,6 +1205,11 @@ impl MsgSender {
             Ok(SendOrQueResult::InQueue)
         }
     }
+}
+
+pub struct AcquiredSendBuffer<'sender> {
+    sender: &'sender mut MsgSender,
+    request_nbytes: usize,
 }
 
 //====================================================================================
@@ -1604,5 +1622,23 @@ impl<UserCommand> Reactor for CommandReactor<UserCommand> {
         ctx: &mut DispatchContext<Self::UserCommand>,
     ) -> Result<()> {
         (self.cmd_handler)(cmd, ctx)
+    }
+}
+
+#[cfg(test)]
+mod test {
+
+    static EMPTY_COMPLETION_FUNC: fn() = || {};
+    fn is_empty_function(_fun: &(dyn Fn() + 'static)) -> Option<Box<dyn Fn() + 'static>> {
+        // if std::ptr::eq(fun, &EMPTY_COMPLETION_FUNC as &dyn Fn()) {
+        // return None;
+        // }
+        None
+        // Some(Box::new((*fun).clone())) // No way to clone Fn()
+    }
+
+    #[test]
+    pub fn test_compare_function() {
+        assert!(is_empty_function(&EMPTY_COMPLETION_FUNC).is_none());
     }
 }

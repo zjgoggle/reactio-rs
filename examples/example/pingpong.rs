@@ -210,8 +210,7 @@ impl PingpongReactor {
             *header_sendtime = utils::cpu_now_nanos();
         }
 
-        ctx.sender
-            .send_or_que(ctx.sock, &buf[..(msg.len() + MSG_HEADER_SIZE)], || {})?;
+        ctx.send_msg(&buf[..(msg.len() + MSG_HEADER_SIZE)])?;
         Ok(())
     }
 }
