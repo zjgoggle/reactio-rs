@@ -10,14 +10,14 @@ use pingpong::PingpongReactor;
 
 use super::*;
 
-/// `MyThreadedReactor` wraps PingpongReactor in multi-threaded environment.
-pub struct MyThreadedReactor {
+/// `ThreadedPingpongReactor` wraps PingpongReactor in multi-threaded environment.
+pub struct ThreadedPingpongReactor {
     runtimeid: usize,
     reactormgr: Arc<ThreadedReactorMgr<<PingpongReactor as Reactor>::UserCommand>>,
     stopcounter: Arc<AtomicI32>,
     inner: PingpongReactor,
 }
-impl MyThreadedReactor {
+impl ThreadedPingpongReactor {
     pub fn new_client(
         name: String,
         runtimeid: usize,
@@ -34,7 +34,7 @@ impl MyThreadedReactor {
         }
     }
 }
-impl Drop for MyThreadedReactor {
+impl Drop for ThreadedPingpongReactor {
     fn drop(&mut self) {
         self.reactormgr.remove_reactor_name(&self.inner.name);
         logmsg!("Dropping reactor: {}", self.inner.name);
@@ -49,7 +49,7 @@ pub struct ThreadedServerParam {
     pub name: String,
     pub latency_batch: i32,
 }
-impl NewServerReactor for MyThreadedReactor {
+impl NewServerReactor for ThreadedPingpongReactor {
     type InitServerParam = ThreadedServerParam;
     fn new_server_reactor(count: usize, p: Self::InitServerParam) -> Self {
         Self {
@@ -65,7 +65,7 @@ impl NewServerReactor for MyThreadedReactor {
         }
     }
 }
-impl Reactor for MyThreadedReactor {
+impl Reactor for ThreadedPingpongReactor {
     type UserCommand = <PingpongReactor as Reactor>::UserCommand;
 
     fn on_connected(
@@ -155,8 +155,8 @@ impl Reactor for MyThreadedReactor {
 pub fn create_tcp_listener(
     recv_buffer_min_size: usize,
     param: ThreadedServerParam,
-) -> DefaultTcpListenerHandler<MyThreadedReactor> {
-    DefaultTcpListenerHandler::<MyThreadedReactor>::new(recv_buffer_min_size, param)
+) -> DefaultTcpListenerHandler<ThreadedPingpongReactor> {
+    DefaultTcpListenerHandler::<ThreadedPingpongReactor>::new(recv_buffer_min_size, param)
 }
 
 #[cfg(test)]
@@ -168,7 +168,7 @@ mod test {
     use super::*;
 
     #[test]
-    pub fn test_threaded_reactors() {
+    pub fn test_threaded_pingpong() {
         let addr = "127.0.0.1:12355";
         let recv_buffer_min_size = 1024;
         let stopcounter = Arc::new(AtomicI32::new(0)); // each Reactor increases it when exiting.
@@ -206,7 +206,7 @@ mod test {
                         .send_connect(
                             addr,
                             recv_buffer_min_size,
-                            MyThreadedReactor::new_client(
+                            ThreadedPingpongReactor::new_client(
                                 "myclient".to_owned(),
                                 threadid1,
                                 Arc::clone(&amgr),
@@ -227,7 +227,7 @@ mod test {
             .unwrap();
 
         // wait for 2 reactors exit
-        let timer = utils::Timer::new_millis(2000);
+        let timer = utils::Timer::new_millis(1000);
         while stopcounter.load(atomic::Ordering::Relaxed) != 2 {
             timer.sleep_or_expire(10);
             std::thread::yield_now();

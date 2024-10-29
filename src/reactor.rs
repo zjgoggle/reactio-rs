@@ -347,7 +347,7 @@ fn min_heap_pop(v: &mut [DeferredKey]) {
     v[v.len() - 1] = value;
 }
 
-// Make a seperate struct ReactorMgr because when interating TcpConnectionMgr::events, sessions must be mutable in process_events.
+// Make a separate struct ReactorMgr because when interating TcpConnectionMgr::events, sessions must be mutable in process_events.
 struct ReactorMgr<UserCommand> {
     socket_handlers: FlatStorage<TcpSocketHandler<UserCommand>>,
     poller: Poller,
@@ -1043,37 +1043,37 @@ impl MsgSender {
     }
 
     // try send until Err, WOULDBLOCK or Complete.
-    // return <bytes_sent, errMsg>
-    pub fn try_send_all(sock: &mut std::net::TcpStream, buf: &[u8]) -> (usize, String) {
+    // return number of bytes having sent.
+    pub fn try_send_all(sock: &mut std::net::TcpStream, buf: &[u8]) -> std::io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
         let mut buf = buf;
         let mut sentbytes = 0;
         loop {
             match sock.write(buf) {
                 std::io::Result::Ok(bytes) => {
-                    if bytes == 0 {
-                        logmsg!("[ERROR] sock 0 bytes {sock:?}. close socket");
-                        return (sentbytes, "Peer closed.".to_owned());
-                    } else if bytes < buf.len() {
+                    if bytes < buf.len() {
                         buf = &buf[bytes..];
                         sentbytes += bytes; // retry next loop
                     } else {
-                        return (sentbytes + bytes, String::new()); // sent
+                        return Ok(sentbytes + bytes); // sent
                     }
                 }
                 std::io::Result::Err(err) => {
                     let errkind = err.kind();
                     if errkind == ErrorKind::WouldBlock {
-                        return (sentbytes, String::new()); // queued
+                        return Ok(sentbytes); // queued
                     } else if errkind == ErrorKind::ConnectionReset {
                         logmsg!("sock reset : {sock:?}. close socket");
-                        return (sentbytes, "socket reset.".to_owned());
+                        return Err(err);
                     // socket closed
                     } else if errkind == ErrorKind::Interrupted {
                         logmsg!("[WARN] sock Interrupted : {sock:?}. retry");
-                        return (sentbytes, String::new()); // Interrupted is not an error. queue
+                        return Err(err); // Interrupted is not an error. queue
                     } else {
                         logmsg!("[ERROR]: write on sock {sock:?}, error: {err:?}");
-                        return (sentbytes, "write socket error.".to_owned());
+                        return Err(err);
                     }
                 }
             }
@@ -1107,10 +1107,13 @@ impl MsgSender {
         debug_assert_eq!(self.last_pending_id, usize::MAX);
         debug_assert_eq!(self.pending.len(), 0);
 
-        let (sentbytes, err) = MsgSender::try_send_all(sock, buf);
-        if !err.is_empty() {
-            return Err(err);
-        }
+        let sentbytes = match MsgSender::try_send_all(sock, buf) {
+            Err(err) => {
+                return Err(err.to_string());
+            }
+            Ok(bytes) => bytes,
+        };
+
         if sentbytes == buf.len() {
             if let Some(callback) = send_completion {
                 (callback)();
@@ -1246,33 +1249,45 @@ impl<'sender> AutoSendBuffer<'sender> {
     pub fn count_written(&self) -> usize {
         self.sender.buf.len() - self.old_buf_size
     }
-    pub fn send(&mut self, send_completion: Option<Box<dyn FnOnce()>>) -> Result<SendOrQueResult> {
+    pub fn send(
+        &mut self,
+        send_completion: Option<Box<dyn FnOnce()>>,
+    ) -> std::io::Result<SendOrQueResult> {
         let buf = &self.sender.buf[self.old_buf_size..];
         if buf.is_empty() {
             if let Some(callback) = send_completion {
                 (callback)();
             }
+            self.old_buf_size = self.sender.buf.len();
             return Ok(SendOrQueResult::Complete);
         }
         if self.old_buf_size > 0 {
             self.sender.queue_msg_completion(buf.len(), send_completion);
+            self.old_buf_size = self.sender.buf.len();
             return Ok(SendOrQueResult::InQueue);
         }
 
-        let (sentbytes, err) = MsgSender::try_send_all(self.sock, buf);
-        if !err.is_empty() {
-            return Err(err);
-        }
+        let sentbytes = match MsgSender::try_send_all(self.sock, buf) {
+            Err(err) => {
+                self.sender.close_or_error = true;
+                self.old_buf_size = self.sender.buf.len();
+                return Err(err);
+            }
+            Ok(bytes) => bytes,
+        };
+
         if sentbytes == buf.len() {
             if let Some(callback) = send_completion {
                 (callback)();
             }
+            self.old_buf_size = self.sender.buf.len();
             return Ok(SendOrQueResult::Complete); // sent
         }
         //---- queue the remaining bytes
         self.sender.move_buf_front_after_send(sentbytes);
         self.sender
             .queue_msg_completion(self.sender.buf.len(), send_completion);
+        self.old_buf_size = self.sender.buf.len();
         Ok(SendOrQueResult::InQueue)
     }
 }
@@ -1281,23 +1296,15 @@ impl<'sender> Drop for AutoSendBuffer<'sender> {
         self.send(None).unwrap(); // send on drop
     }
 }
-impl<'sender> std::fmt::Write for AutoSendBuffer<'sender> {
-    fn write_str(&mut self, s: &str) -> std::fmt::Result {
-        self.sender.buf.extend_from_slice(s.as_bytes());
+impl<'sender> std::io::Write for AutoSendBuffer<'sender> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.sender.buf.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.send(None)?;
         Ok(())
     }
-    // fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-    //     self.sender.buf.extend_from_slice(buf);
-    //     Ok(buf.len())
-    // }
-    // fn flush(&mut self) -> std::io::Result<()> {
-    //     if self.sender.buf.len() > self.old_buf_size {
-    //         if let Err(err) = self.send(None) {
-    //             Err()
-    //         }
-    //     }
-    //     Ok(())
-    // }
 }
 
 //====================================================================================
@@ -1568,6 +1575,7 @@ impl<NewReactor: NewServerReactor + 'static> TcpListenerHandler
 
 pub type SimpleIoRuntime = ReactRuntime<()>;
 pub type SimpleIoReactorContext<'a> = DispatchContext<'a, ()>;
+pub type DynIoReactor = dyn Reactor<UserCommand = ()>;
 
 type OnConnectedHandler = dyn FnMut(
     &mut SimpleIoReactorContext<'_>,
@@ -1603,6 +1611,18 @@ impl SimpleIoReactor {
             on_closed_handler,
             on_sock_msg_handler: Box::new(on_sock_msg_handler),
         }
+    }
+    pub fn new_boxed(
+        on_connected_handler: Option<Box<OnConnectedHandler>>,
+        on_closed_handler: Option<Box<OnClosedHandler>>,
+        on_sock_msg_handler: impl FnMut(&mut [u8], &mut SimpleIoReactorContext<'_>) -> Result<usize>
+            + 'static,
+    ) -> Box<dyn Reactor<UserCommand = ()>> {
+        Box::new(Self {
+            on_connected_handler,
+            on_closed_handler,
+            on_sock_msg_handler: Box::new(on_sock_msg_handler),
+        })
     }
 }
 impl Reactor for SimpleIoReactor {
@@ -1640,12 +1660,12 @@ pub struct SimpleIoListener {
     count_children: usize,
     reactorid: ReactorID,
     recv_buffer_min_size: usize,
-    reactor_creator: Box<dyn FnMut(usize) -> Option<SimpleIoReactor>>, // call reactor_creator(children_count) to create SimpleIoReactor
+    reactor_creator: Box<dyn FnMut(usize) -> Option<Box<DynIoReactor>>>, // call reactor_creator(children_count) to create SimpleIoReactor
 }
 impl SimpleIoListener {
     pub fn new(
         recv_buffer_min_size: usize,
-        reactor_creator: impl FnMut(usize) -> Option<SimpleIoReactor> + 'static,
+        reactor_creator: impl FnMut(usize) -> Option<Box<DynIoReactor>> + 'static,
     ) -> Self {
         Self {
             count_children: 0,
@@ -1672,7 +1692,7 @@ impl TcpListenerHandler for SimpleIoListener {
     ) -> Option<NewStreamConnection<Self::UserCommand>> {
         self.count_children += 1;
         (self.reactor_creator)(self.count_children).map(|reactor| NewStreamConnection {
-            reactor: Box::new(reactor),
+            reactor,
             recv_buffer_min_size: self.recv_buffer_min_size,
         })
     }

@@ -271,7 +271,7 @@ mod test {
             )
             .unwrap();
         // In non-threaded environment, process_events until there're no reactors, no events, no deferred events.
-        let timer = utils::Timer::new_millis(2000);
+        let timer = utils::Timer::new_millis(1000);
         while runtime.process_events() {
             if timer.expired() {
                 assert!(false, "ERROR: timeout waiting for tests to complete!");

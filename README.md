@@ -30,7 +30,7 @@ When processing events, Reactor doesn't need any mutex to protect resources.
 
 ## Examples
 
-### Single-threaded ReactRuntime
+### None-threaded ReactRuntime
 
 #### Example 1: Define a struct MyReactor to implement Reactor.
 See example in reactor.rs.
@@ -66,7 +66,7 @@ pub fn test_ping_pong_reactor() {
         )
         .unwrap();
     // In non-threaded environment, process_events until there're no reactors, no events, no deferred events.
-    let timer = utils::Timer::new_millis(2000);
+    let timer = utils::Timer::new_millis(1000);
     while runtime.process_events() {
         if timer.expired() {
             assert!(false, "ERROR: timeout waiting for tests to complete!");
@@ -106,7 +106,7 @@ pub fn test_io_reactor() {
 
     let on_new_connection = move |_childid| {
         // create a new Reactor for the new connection.
-        Some(reactio::SimpleIoReactor::new(
+        Some(reactio::SimpleIoReactor::new_boxed(
             Some(Box::new(on_server_connected)), // on_connected
             None,                                // on_closed
             on_sock_msg,                         // on_sock_msg
@@ -159,7 +159,7 @@ pub fn test_io_reactor() {
         )
         .unwrap();
     // In non-threaded environment, process_events until there're no reactors, no events, no deferred events.
-    let timer = reactio::utils::Timer::new_millis(1000 * 20);
+    let timer = reactio::utils::Timer::new_millis(1000);
     while runtime.process_events() {
         if timer.expired() {
             assert!(false, "ERROR: timeout waiting for tests to complete!");
@@ -171,11 +171,11 @@ pub fn test_io_reactor() {
 }
 ```
 
-### Multi-threaded Reactors - Each thread runs an ReactRuntime
+### Multi-threaded Reactor Example - Each thread runs an ReactRuntime
 
-See example in threaded_reactors.rs.
+See example in `threaded_pingpong.rs`.
 ```rust,no_run
-pub fn test_threaded_reactors() {
+pub fn test_threaded_pingpong() {
     let addr = "127.0.0.1:12355";
     let recv_buffer_min_size = 1024;
     let stopcounter = Arc::new(AtomicI32::new(0)); // each Reactor increases it when exiting.
@@ -213,7 +213,7 @@ pub fn test_threaded_reactors() {
                     .send_connect(
                         addr,
                         recv_buffer_min_size,
-                        MyThreadedReactor::new_client(
+                        ThreadedPingpongReactor::new_client(
                             "myclient".to_owned(),
                             threadid1,
                             Arc::clone(&amgr),
@@ -234,7 +234,7 @@ pub fn test_threaded_reactors() {
         .unwrap();
 
     // wait for 2 reactors exit
-    let timer = utils::Timer::new_millis(2000);
+    let timer = utils::Timer::new_millis(1000);
     while stopcounter.load(atomic::Ordering::Relaxed) != 2 {
         timer.sleep_or_expire(10);
         std::thread::yield_now();

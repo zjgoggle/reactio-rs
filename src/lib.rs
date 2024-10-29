@@ -5,8 +5,9 @@
 //! ReactIO is a Rust library that implements event-driven Reactor pattern in single-threaded and multiple-threaded environment.
 //! Users implement a `Reactor` (as least implement `on_inbound_message`) and add it to a `ReactRuntime`.
 //! Each `ReactRuntime` instance runs in a dedicated thread. It polls all events for all managed Reactors. There'are 2 kinds of events:
-//! - socket events. We only register socket READ events initially. MsgReader & MsgSender are provided for Reactor to send/receive messages.
-//! - commands. Through mpsc channel, reactors could send user defined commands to each other.
+//! - Socket events. We only register socket READ events initially. MsgReader & MsgSender are provided for Reactor to send/receive messages.
+//!   MsgReader reads from buffer and dispatches messages. MsgSender sends or register SEND event for resend when seeing WOULDBLOCK.
+//! - Commands. Through mpsc channel, reactors could send user defined commands to each other.
 //!
 //!
 //! Key technologies:
@@ -23,7 +24,7 @@
 //! See example in reactor.rs.
 //! ```rust,no_run
 //! use reactio;
-//! use std::fmt::Write;
+//! use std::io::Write;
 //!
 //! /// SimpleIoReactor implements `Reactor` and calls user-given handlers on events.
 //! pub fn test_io_reactor() {
@@ -50,7 +51,7 @@
 //!
 //!     let on_new_connection = move |_childid| {
 //!         // create a new Reactor for the new connection.
-//!         Some(reactio::SimpleIoReactor::new(
+//!         Some(reactio::SimpleIoReactor::new_boxed(
 //!             Some(Box::new(on_server_connected)), // on_connected
 //!             None,                                // on_closed
 //!             on_sock_msg,                         // on_sock_msg
@@ -103,7 +104,7 @@
 //!         )
 //!         .unwrap();
 //!     // In non-threaded environment, process_events until there're no reactors, no events, no deferred events.
-//!     let timer = reactio::utils::Timer::new_millis(1000 * 20);
+//!     let timer = reactio::utils::Timer::new_millis(1000);
 //!     while runtime.process_events() {
 //!         if timer.expired() {
 //!             assert!(false, "ERROR: timeout waiting for tests to complete!");
@@ -115,7 +116,7 @@
 //! }
 //! ```
 //!
-//! See examples folder for more examples about echo_client/echo_server (test TCP latencies), PingpongReactor, PingpongReactor.
+//! See examples folder for more examples about echo_client/echo_server (for TCP latency test), PingpongReactor, ThreadedPingpongReactor.
 //!
 
 #![allow(dead_code)]

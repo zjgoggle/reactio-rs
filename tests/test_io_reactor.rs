@@ -3,7 +3,7 @@ extern crate reactio;
 
 #[cfg(test)]
 mod test {
-    use std::fmt::Write;
+    use std::io::Write;
 
     #[test]
     /// SimpleIoReactor implements `Reactor` and calls user handlers on events.
@@ -11,16 +11,18 @@ mod test {
         let addr = "127.0.0.1:12355";
         let recv_buffer_min_size = 1024;
         let mut runtime = reactio::SimpleIoRuntime::new();
-        let max_echos = 1;
-        let mut count_echos = 0;
 
-        let on_sock_msg = move |buf: &mut [u8], ctx: &mut reactio::SimpleIoReactorContext<'_>| {
-            if count_echos >= max_echos {
-                return Err(format!("Reached max echo: {max_echos}")); // close socket
+        let on_sock_msg = {
+            let max_echos = 1;
+            let mut count_echos = 0;
+            move |buf: &mut [u8], ctx: &mut reactio::SimpleIoReactorContext<'_>| {
+                if count_echos >= max_echos {
+                    return Err(format!("Reached max echo: {max_echos}")); // close socket
+                }
+                ctx.send_msg(buf)?; // echo back message.
+                count_echos += 1;
+                Ok(buf.len()) // return number of bytes having been consumed.
             }
-            ctx.send_msg(buf)?; // echo back message.
-            count_echos += 1;
-            Ok(buf.len()) // return number of bytes having been consumed.
         };
 
         let on_server_connected = |ctx: &mut reactio::SimpleIoReactorContext<'_>, listenerid| {
@@ -31,7 +33,7 @@ mod test {
 
         let on_new_connection = move |_childid| {
             // create a new Reactor for the new connection.
-            Some(reactio::SimpleIoReactor::new(
+            Some(reactio::SimpleIoReactor::new_boxed(
                 Some(Box::new(on_server_connected)), // on_connected
                 None,                                // on_closed
                 on_sock_msg,                         // on_sock_msg
@@ -84,7 +86,7 @@ mod test {
             )
             .unwrap();
         // In non-threaded environment, process_events until there're no reactors, no events, no deferred events.
-        let timer = reactio::utils::Timer::new_millis(1000 * 20);
+        let timer = reactio::utils::Timer::new_millis(1000);
         while runtime.process_events() {
             if timer.expired() {
                 logmsg!("ERROR: timeout waiting for tests to complete!");
