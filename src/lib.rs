@@ -76,7 +76,7 @@
 //!             addr,
 //!             reactio::SimpleIoListener::new(recv_buffer_min_size, on_new_connection),
 //!             reactio::Deferred::Immediate,
-//!             |_| {},
+//!             |_| {},  //OnCommandCompletion
 //!         )
 //!         .unwrap();
 //!     // wait for server ready.
@@ -100,7 +100,7 @@
 //!                 on_sock_msg,                         // on_sock_msg
 //!             ),
 //!             reactio::Deferred::Immediate,
-//!             |_| {},
+//!             |_| {},  // OnCommandCompletion
 //!         )
 //!         .unwrap();
 //!     // In non-threaded environment, process_events until there're no reactors, no events, no deferred events.
@@ -116,7 +116,7 @@
 //! }
 //! ```
 //!
-//! See examples folder for more examples about echo_client/echo_server (for TCP latency test), PingpongReactor, ThreadedPingpongReactor.
+//! More examples are echo_client/echo_server (for TCP latency test), PingpongReactor, ThreadedPingpongReactor.
 //!
 
 #![allow(dead_code)]

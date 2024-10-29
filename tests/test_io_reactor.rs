@@ -58,7 +58,7 @@ mod test {
                 addr,
                 reactio::SimpleIoListener::new(recv_buffer_min_size, on_new_connection),
                 reactio::Deferred::Immediate,
-                |_| {},
+                |_| {}, // OnCommandCompletion
             )
             .unwrap();
         // wait for server ready.
@@ -82,7 +82,7 @@ mod test {
                     on_sock_msg,                         // on_sock_msg
                 ),
                 reactio::Deferred::Immediate,
-                |_| {},
+                |_| {}, // OnCommandCompletion
             )
             .unwrap();
         // In non-threaded environment, process_events until there're no reactors, no events, no deferred events.

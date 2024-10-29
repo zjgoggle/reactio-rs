@@ -195,7 +195,7 @@ mod test {
                     },
                 ),
                 Deferred::Immediate,
-                // OnCompletion, when listen socket is ready, send another command to connect from another thread.
+                // OnCommandCompletion, when listen socket is ready, send another command to connect from another thread.
                 move |res| {
                     if let CommandCompletion::Error(_) = res {
                         logmsg!("[ERROR] Failed to listen exit!");

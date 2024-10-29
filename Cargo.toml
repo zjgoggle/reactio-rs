@@ -1,11 +1,11 @@
 [package]
 name = "reactio"
-version = "0.1.5"
+version = "0.1.6"
 edition = "2021"
 
 authors = ["Jack Zhang <zjgoggle@gmail.com>"]
 rust-version = "1.63"
-description = "Event Driven Nonblocking Reactor Pattern"
+description = "Low-Latency Event Driven Nonblocking Reactor Pattern"
 license = "Apache-2.0 OR MIT"
 repository = "https://github.com/zjgoggle/reactio-rs"
 readme = "README.md"

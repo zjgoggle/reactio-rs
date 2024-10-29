@@ -1221,7 +1221,7 @@ impl MsgSender {
         //- move front buf
         let len = self.buf.len();
         self.buf.copy_within(sentbytes..len, 0);
-        self.buf.resize(self.buf.len() - sentbytes, 0);
+        self.buf.resize(len - sentbytes, 0);
         if self.buf.is_empty() {
             // reset members if buf is empty.
             debug_assert_eq!(self.first_pending_id, usize::MAX);
@@ -1254,6 +1254,7 @@ impl<'sender> AutoSendBuffer<'sender> {
         send_completion: Option<Box<dyn FnOnce()>>,
     ) -> std::io::Result<SendOrQueResult> {
         let buf = &self.sender.buf[self.old_buf_size..];
+        let buf_len = buf.len();
         if buf.is_empty() {
             if let Some(callback) = send_completion {
                 (callback)();
@@ -1276,7 +1277,11 @@ impl<'sender> AutoSendBuffer<'sender> {
             Ok(bytes) => bytes,
         };
 
-        if sentbytes == buf.len() {
+        if sentbytes > 0 {
+            self.sender.move_buf_front_after_send(sentbytes);
+        }
+
+        if sentbytes == buf_len {
             if let Some(callback) = send_completion {
                 (callback)();
             }
@@ -1284,7 +1289,6 @@ impl<'sender> AutoSendBuffer<'sender> {
             return Ok(SendOrQueResult::Complete); // sent
         }
         //---- queue the remaining bytes
-        self.sender.move_buf_front_after_send(sentbytes);
         self.sender
             .queue_msg_completion(self.sender.buf.len(), send_completion);
         self.old_buf_size = self.sender.buf.len();
@@ -1470,7 +1474,7 @@ impl MsgReader {
                         debug_assert!(false, "on_inbound_message expects an already full message.");
                     }
                     self.decoded_msgsize = msgsize; // could be 0 if msg size is unknown.
-                    new_bytes = 0; // all has been processed.
+                    break; // read more in next round.
                 }
                 MessageResult::DropMsgSize(msgsize) => {
                     assert!(msgsize > 0 && msgsize <= self.bufsize - self.startpos); // drop size should not exceed buffer size.

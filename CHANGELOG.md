@@ -1,7 +1,9 @@
+# Version 0.1.6
+- Bugfix: try_dispatch_all; AutoSendBuffer::send.
+
 # Version 0.1.5
 - Add SimpleIoReactor::new_boxed.
 - AutoSendBuffer impl std::io::Write instead of std::fmt::Write
-- TODO: support non-socket reactors.
 
 # Version 0.1.4
 - Two stage AutoSendBuffer: write messages to send_buf and auto send on drop.

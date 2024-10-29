@@ -5,9 +5,9 @@
 [![Cargo](https://img.shields.io/crates/v/reactio.svg)](https://crates.io/crates/reactio)
 [![Documentation](https://docs.rs/reactio/badge.svg)](https://docs.rs/reactio)
 
-Event-driven Non-blocking Reactor pattern in Rust.
+Low-latency Event-driven Non-blocking Reactor pattern in Rust.
 
-Supported platforms: Linux, Windows     
+Supported platforms: Linux, Windows and x86_64, arm64. (Other platforms are not tested.)
 
 **Only 64-bit platforms are supported**
 
@@ -33,7 +33,9 @@ When processing events, Reactor doesn't need any mutex to protect resources.
 ### None-threaded ReactRuntime
 
 #### Example 1: Define a struct MyReactor to implement Reactor.
-See example in reactor.rs.
+
+More tests are in [tests](tests) and [examples](examples).
+
 ```rust,no_run
 // PingpongReactor is a Reactor to send back any received messages, which could be used to test round-trip TCP time.
 pub fn test_ping_pong_reactor() {
@@ -52,7 +54,7 @@ pub fn test_ping_pong_reactor() {
                 },
             ),
             Deferred::Immediate,
-            |_| {},
+            |_| {},  // OnCommandCompletion
         )
         .unwrap();
     cmd_sender
@@ -62,7 +64,7 @@ pub fn test_ping_pong_reactor() {
             // client PingpongReactor initiate a message. It sends echo back 2 messages before close and latency_batch=1000.
             PingpongReactor::new_client("client".to_owned(), 2, 1000),
             Deferred::Immediate,
-            |_| {},
+            |_| {},  // OnCommandCompletion
         )
         .unwrap();
     // In non-threaded environment, process_events until there're no reactors, no events, no deferred events.
@@ -131,7 +133,7 @@ pub fn test_io_reactor() {
             addr,
             reactio::SimpleIoListener::new(recv_buffer_min_size, on_new_connection),
             reactio::Deferred::Immediate,
-            |_| {},
+            |_| {},  // OnCommandCompletion
         )
         .unwrap();
     // wait for server ready.
@@ -155,7 +157,7 @@ pub fn test_io_reactor() {
                 on_sock_msg,                         // on_sock_msg
             ),
             reactio::Deferred::Immediate,
-            |_| {},
+            |_| {},  // OnCommandCompletion
         )
         .unwrap();
     // In non-threaded environment, process_events until there're no reactors, no events, no deferred events.
@@ -202,7 +204,7 @@ pub fn test_threaded_pingpong() {
                 },
             ),
             Deferred::Immediate,
-            // OnCompletion, when listen socket is ready, send another command to connect from another thread.
+            // OnCommandCompletion, when listen socket is ready, send another command to connect from another thread.
             move |res| {
                 if let CommandCompletion::Error(_) = res {
                     logmsg!("[ERROR] Failed to listen exit!");
