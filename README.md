@@ -32,7 +32,7 @@ When processing events, Reactor doesn't need any mutex to protect resources.
 
 ### None-threaded ReactRuntime
 
-#### Example 1: Define a struct MyReactor to implement Reactor.
+#### Example 1: Define a struct PingpongReactor to implement Reactor.
 
 More tests are in [tests](tests) and [examples](examples).
 

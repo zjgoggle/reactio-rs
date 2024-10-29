@@ -520,9 +520,10 @@ impl<UserCommand> ReactorMgr<UserCommand> {
                 TcpSocketHandler::StreamType(sockdata, mut reactor) => {
                     debug_assert_eq!(reactorid, sockdata.reactorid);
                     logmsg!(
-                        "removing reactorid: {}, sock: {:?}, pending_send_bytes: {}",
+                        "removing reactorid: {}, sock: {:?}, pending_read_bytes: {}, pending_send_bytes: {}",
                         reactorid,
                         sockdata.sock,
+                        sockdata.reader.bytes_in_buffer(),
                         sockdata.sender.buf.len()
                     );
                     self.count_streams -= 1;
@@ -708,7 +709,7 @@ impl<UserCommand> ReactRuntime<UserCommand> {
                                 &self.mgr.cmd_sender,
                             )) {
                                 if !err.is_empty() {
-                                    logmsg!("on_readable requested close current_reactorid: {current_reactorid}, sock: {:?}", ctx.sock);
+                                    logmsg!("on_readable requested close current_reactorid: {current_reactorid}, sock: {:?}. Reason: {}", ctx.sock, err);
                                 }
                                 removesock = true;
                             }
@@ -1337,6 +1338,16 @@ impl MsgReader {
         }
     }
 
+    pub fn bytes_in_buffer(&self) -> usize {
+        self.bufsize - self.startpos
+    }
+
+    pub fn clear(&mut self) {
+        self.decoded_msgsize = 0;
+        self.startpos = 0;
+        self.bufsize = 0;
+    }
+
     /// Strategy 1: fast dispatch: dispatch on each read of about min_reserve bytes.
     /// return Err to close socket
     pub fn try_read_fast_dispatch<UserCommand>(
@@ -1358,7 +1369,7 @@ impl MsgReader {
             match ctx.sock.read(&mut self.recv_buffer[self.bufsize..]) {
                 std::io::Result::Ok(new_bytes) => {
                     if new_bytes == 0 {
-                        return Err(format!("peer closed sock: {:?}", ctx.sock));
+                        return Err("Peer closed sock".to_owned());
                     }
                     debug_assert!(self.bufsize + new_bytes <= self.recv_buffer.len());
 
@@ -1377,20 +1388,14 @@ impl MsgReader {
                     if errkind == ErrorKind::WouldBlock {
                         return Ok(()); // wait for next readable.
                     } else if errkind == ErrorKind::ConnectionReset {
-                        return Err(format!("sock reset : {:?}. close socket", ctx.sock));
+                        return Err("Sock reset".to_owned());
                     } else if errkind == ErrorKind::Interrupted {
                         logmsg!("[WARN] sock Interrupted : {:?}. retry", ctx.sock);
                         return Ok(()); // Interrupted is not an error.
                     } else if errkind == ErrorKind::ConnectionAborted {
-                        return Err(format!(
-                            "sock ConnectionAborted : {:?}. close socket",
-                            ctx.sock
-                        )); // closed by remote (windows)
+                        return Err("Sock ConnectionAborted".to_owned()); // closed by remote (windows)
                     }
-                    return Err(format!(
-                        "[ERROR]: read on sock {:?}, error: {err:?}",
-                        ctx.sock
-                    ));
+                    return Err(format!("[ERROR]: Read on sock error: {err:?}"));
                 }
             }
         }
@@ -1412,7 +1417,7 @@ impl MsgReader {
             match ctx.sock.read(&mut self.recv_buffer[self.bufsize..]) {
                 std::io::Result::Ok(new_bytes) => {
                     if new_bytes == 0 {
-                        return Err(format!("peer closed sock: {:?}", ctx.sock));
+                        return Err("Peer closed sock".to_owned());
                     }
                     debug_assert!(self.bufsize + new_bytes <= self.recv_buffer.len());
 
@@ -1427,21 +1432,15 @@ impl MsgReader {
                     if errkind == ErrorKind::WouldBlock {
                         return Ok(()); // wait for next readable.
                     } else if errkind == ErrorKind::ConnectionReset {
-                        return Err(format!("sock reset : {:?}. close socket", ctx.sock));
+                        return Err("Sock ConnectionReset".to_owned());
                     // socket closed
                     } else if errkind == ErrorKind::Interrupted {
                         logmsg!("[WARN] sock Interrupted : {:?}. retry", ctx.sock);
                         return Ok(()); // Interrupted is not an error.
                     } else if errkind == ErrorKind::ConnectionAborted {
-                        return Err(format!(
-                            "sock ConnectionAborted : {:?}. close socket",
-                            ctx.sock
-                        )); // closed by remote (windows)
+                        return Err("sock ConnectionAborted".to_owned()); // closed by remote (windows)
                     }
-                    return Err(format!(
-                        "[ERROR]: read on sock {:?}, error: {err:?}",
-                        ctx.sock
-                    ));
+                    return Err(format!("[ERROR]: Read on sock error: {err:?}"));
                 }
             } // match
         } // loop
@@ -1460,27 +1459,37 @@ impl MsgReader {
         while self.startpos < self.bufsize
             && (self.decoded_msgsize == 0 || self.startpos + self.decoded_msgsize <= self.bufsize)
         {
-            let res = dispatcher.on_inbound_message(
+            match dispatcher.on_inbound_message(
                 &mut self.recv_buffer[self.startpos..self.bufsize],
                 new_bytes,
                 self.decoded_msgsize,
                 ctx,
-            )?;
-            match res {
-                MessageResult::ExpectMsgSize(msgsize) => {
-                    if !(msgsize == 0 || msgsize > self.bufsize - self.startpos) {
-                        logmsg!( "[WARN] on_inbound_message should NOT expect a msgsize while full message is already received, which may cause recursive call. msgsize:{msgsize:?} recved: {}",
-                            self.bufsize - self.startpos);
-                        debug_assert!(false, "on_inbound_message expects an already full message.");
-                    }
-                    self.decoded_msgsize = msgsize; // could be 0 if msg size is unknown.
-                    break; // read more in next round.
+            ) {
+                Err(err) => {
+                    self.clear(); // user requested close. clear read buffer.
+                    return Err(err);
                 }
-                MessageResult::DropMsgSize(msgsize) => {
-                    assert!(msgsize > 0 && msgsize <= self.bufsize - self.startpos); // drop size should not exceed buffer size.
-                    self.startpos += msgsize;
-                    self.decoded_msgsize = 0;
-                    new_bytes = self.bufsize - self.startpos;
+                Ok(res) => {
+                    match res {
+                        MessageResult::ExpectMsgSize(msgsize) => {
+                            if !(msgsize == 0 || msgsize > self.bufsize - self.startpos) {
+                                logmsg!( "[WARN] on_inbound_message should NOT expect a msgsize while full message is already received, which may cause recursive call. msgsize:{msgsize:?} recved: {}",
+                            self.bufsize - self.startpos);
+                                debug_assert!(
+                                    false,
+                                    "on_inbound_message expects an already full message."
+                                );
+                            }
+                            self.decoded_msgsize = msgsize; // could be 0 if msg size is unknown.
+                            break; // read more in next round.
+                        }
+                        MessageResult::DropMsgSize(msgsize) => {
+                            assert!(msgsize > 0 && msgsize <= self.bufsize - self.startpos); // drop size should not exceed buffer size.
+                            self.startpos += msgsize;
+                            self.decoded_msgsize = 0;
+                            new_bytes = self.bufsize - self.startpos;
+                        }
+                    }
                 }
             }
         }
