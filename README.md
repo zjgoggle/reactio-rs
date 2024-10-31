@@ -1,8 +1,10 @@
 # ReactIO
 
-[![Build](https://github.com/zjgoggle/reactio-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/zjgoggle/reactio-rs/actions)
+[![Build](https://github.com/zjgoggle/reactio-rs/actions/workflows/build-test.yml/badge.svg)](https://github.com/zjgoggle/reactio-rs/actions)
 [![License](https://img.shields.io/badge/license-Apache--2.0_OR_MIT-blue.svg)](https://github.com/zjgoggle/reactio-rs)
 [![Cargo](https://img.shields.io/crates/v/reactio.svg)](https://crates.io/crates/reactio)
+[![depstatus](https://deps.rs/repo/github/zjgoggle/reactio-rs/status.svg)](https://deps.rs/repo/github/zjgoggle/reactio-rs)
+[![Crates.io](https://img.shields.io/crates/d/reactio)](https://github.com/zjgoggle/reactio-rs)
 [![Documentation](https://docs.rs/reactio/badge.svg)](https://docs.rs/reactio)
 
 Low-latency Event-driven Non-blocking Reactor pattern in Rust.
@@ -88,16 +90,18 @@ pub fn test_io_reactor() {
     let addr = "127.0.0.1:12355";
     let recv_buffer_min_size = 1024;
     let mut runtime = reactio::SimpleIoRuntime::new();
-    let max_echos = 1;
-    let mut count_echos = 0;
 
-    let on_sock_msg = move |buf: &mut [u8], ctx: &mut reactio::SimpleIoReactorContext<'_>| {
-        if count_echos >= max_echos {
-            return Err(format!("Reached max echo: {max_echos}")); // close socket
+    let on_sock_msg = {
+        let max_echos = 1;
+        let mut count_echos = 0;
+        move |buf: &mut [u8], ctx: &mut reactio::SimpleIoReactorContext<'_>| {
+            if count_echos >= max_echos {
+                return Err(format!("Reached max echo: {max_echos}")); // close socket
+            }
+            ctx.send_msg(buf)?; // echo back message.
+            count_echos += 1;
+            Ok(buf.len()) // return number of bytes having been consumed.
         }
-        ctx.send_msg(ctx.sock, buf)?; // echo back message.
-        count_echos += 1;
-        Ok(buf.len()) // return number of bytes having been consumed.
     };
 
     let on_server_connected = |ctx: &mut reactio::SimpleIoReactorContext<'_>, listenerid| {
@@ -121,6 +125,7 @@ pub fn test_io_reactor() {
         auto_sender.write_fmt(format_args!("test ")).unwrap();
         auto_sender.write_fmt(format_args!("msgsend")).unwrap();
         assert_eq!(auto_sender.count_written(), 12);
+        assert_eq!(auto_sender.get_written(), b"test msgsend");
         // auto_sender.send(None).unwrap(); // this line can be omitted to let it auto send on drop.
         // ctx.send_msg("Hello".as_bytes())?; // rather than using auto_sender, we call ctx to send_msg
         Ok(()) // accept connection
@@ -133,14 +138,14 @@ pub fn test_io_reactor() {
             addr,
             reactio::SimpleIoListener::new(recv_buffer_min_size, on_new_connection),
             reactio::Deferred::Immediate,
-            |_| {},  // OnCommandCompletion
+            |_| {}, // OnCommandCompletion
         )
         .unwrap();
     // wait for server ready.
     let timer = reactio::utils::Timer::new_millis(1000);
     while runtime.count_reactors() < 1 {
         if timer.expired() {
-            assert!(false, "ERROR: timeout waiting for listener start!");
+            logerr!("ERROR: timeout waiting for listener start!");
             break;
         }
         runtime.process_events();
@@ -157,14 +162,14 @@ pub fn test_io_reactor() {
                 on_sock_msg,                         // on_sock_msg
             ),
             reactio::Deferred::Immediate,
-            |_| {},  // OnCommandCompletion
+            |_| {}, // OnCommandCompletion
         )
         .unwrap();
     // In non-threaded environment, process_events until there're no reactors, no events, no deferred events.
     let timer = reactio::utils::Timer::new_millis(1000);
     while runtime.process_events() {
         if timer.expired() {
-            assert!(false, "ERROR: timeout waiting for tests to complete!");
+            logerr!("ERROR: timeout waiting for tests to complete!");
             break;
         }
     }
@@ -206,8 +211,8 @@ pub fn test_threaded_pingpong() {
             Deferred::Immediate,
             // OnCommandCompletion, when listen socket is ready, send another command to connect from another thread.
             move |res| {
-                if let CommandCompletion::Error(_) = res {
-                    logmsg!("[ERROR] Failed to listen exit!");
+                if let Err(err) = res {
+                    logerr!("[ERROR] Failed to listen. {err}");
                     return;
                 }
                 amgr.get_cmd_sender(threadid1)
@@ -225,8 +230,8 @@ pub fn test_threaded_pingpong() {
                         ),
                         Deferred::Immediate,
                         |res| {
-                            if let CommandCompletion::Error(_) = res {
-                                logmsg!("[ERROR] Failed connect!");
+                            if let Err(err) = res {
+                                logerr!("Failed connect! {err}");
                             }
                         },
                     )
@@ -246,6 +251,7 @@ pub fn test_threaded_pingpong() {
         }
     }
 }
+
 ```
 
 ## License

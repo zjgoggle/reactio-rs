@@ -1,5 +1,5 @@
 extern crate libc;
-use std::{io::Write, mem::size_of};
+use std::{io::Write, mem::size_of, sync::atomic::AtomicI32};
 
 pub fn ref_to_bytes<T>(val: &T) -> &[u8] {
     unsafe { std::slice::from_raw_parts(val as *const T as *const u8, size_of::<T>()) }
@@ -145,25 +145,71 @@ impl Timer {
     }
 }
 
+pub const LOG_LEVEL_ERROR: i32 = 0;
+pub const LOG_LEVEL_INFO: i32 = 1;
+pub const LOG_LEVEL_TRACE: i32 = 2;
+pub const LOG_LEVEL_DEBUG: i32 = 3; // DEBUG/dbglog is only enabled in debug build.
+
+#[cfg(debug_assertions)]
+static GLOBAL_LOG_LEVEL: AtomicI32 = AtomicI32::new(LOG_LEVEL_TRACE);
+
+#[cfg(not(debug_assertions))]
+static GLOBAL_LOG_LEVEL: AtomicI32 = AtomicI32::new(LOG_LEVEL_INFO);
+
+pub fn can_log(severity: i32) -> bool {
+    severity <= GLOBAL_LOG_LEVEL.load(std::sync::atomic::Ordering::Acquire)
+}
+pub fn set_log_level(severity: i32) {
+    GLOBAL_LOG_LEVEL.store(severity, std::sync::atomic::Ordering::Release);
+}
+// MAYDO:  log sink, timestamp format, source location.
 #[macro_export]
-macro_rules! logmsg {
+macro_rules! loginfo {
     ($( $args:expr ),*) => {
-        let mut buf = [0u8; 40];
-        print!("[{}] ", $crate::utils::format_time(&mut buf, $crate::utils::now_nanos(), 6, false));
-        println!( $( $args ),* );
-        // std::io::stdout().flush().unwrap();
+        if $crate::utils::can_log($crate::utils::LOG_LEVEL_INFO) {
+            let mut buf = [0u8; 40];
+            print!("[{}] [INFO] ", $crate::utils::format_time(&mut buf, $crate::utils::now_nanos(), 6, false));
+            println!( $( $args ),* );
+            // std::io::stdout().flush().unwrap();
+        }
     }
 }
 
 #[macro_export]
-/// log only in debug mode.
+macro_rules! logerr {
+    ($( $args:expr ),*) => {
+        if $crate::utils::can_log($crate::utils::LOG_LEVEL_ERROR) {
+            let mut buf = [0u8; 40];
+            print!("[{}] [ERROR] ", $crate::utils::format_time(&mut buf, $crate::utils::now_nanos(), 6, false));
+            println!( $( $args ),* );
+            // std::io::stdout().flush().unwrap();
+        }
+    }
+}
+
+#[macro_export]
+macro_rules! logtrace {
+    ($( $args:expr ),*) => {
+        if $crate::utils::can_log($crate::utils::LOG_LEVEL_TRACE) {
+            let mut buf = [0u8; 40];
+            print!("[{}] [TRACE] ", $crate::utils::format_time(&mut buf, $crate::utils::now_nanos(), 6, false));
+            println!( $( $args ),* );
+            // std::io::stdout().flush().unwrap();
+        }
+    }
+}
+
+#[macro_export]
 #[cfg(debug_assertions)]
+/// log only in debug mode.
 macro_rules! dbglog {
     ($( $args:expr ),*) => {
-        let mut buf = [0u8; 40];
-        print!("[{}] [DBG] ", $crate::utils::format_time(&mut buf, $crate::utils::now_nanos(), 6, false));
-        println!( $( $args ),* );
-        // std::io::stdout().flush().unwrap();
+        if $crate::utils::can_log($crate::utils::LOG_LEVEL_DEBUG) {
+            let mut buf = [0u8; 40];
+            print!("[{}] [DEBUG] ", $crate::utils::format_time(&mut buf, $crate::utils::now_nanos(), 6, false));
+            println!( $( $args ),* );
+            // std::io::stdout().flush().unwrap();
+        }
     }
 }
 #[allow(unused_macros)]
@@ -179,22 +225,25 @@ macro_rules! dbglog {
 mod test {
     use std::io::Write;
 
+    use crate::utils::{set_log_level, LOG_LEVEL_ERROR};
+
     // use libc::write;
 
     #[test]
     pub fn test_vec_write() {
         let mut v = Vec::<u8>::new();
         // v.write_fmt(format_args!("hello{}", 2)).expect("failed to write to vec");
+        set_log_level(LOG_LEVEL_ERROR);
         v.resize(10, 1);
         let mut s = &mut v[..];
         s.write_fmt(format_args!("hello{}", 2))
             .expect("failed to write to slice");
-        logmsg!("vec size: {}", v.len());
+        loginfo!("vec size: {}", v.len());
     }
     #[test]
     pub fn test_log() {
         let mut _buf = [0u8; 32];
         dbglog!("test dbglog.");
-        logmsg!("any msg");
+        loginfo!("any msg");
     }
 }

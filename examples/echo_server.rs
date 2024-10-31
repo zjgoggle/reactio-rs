@@ -1,4 +1,4 @@
-use reactio::{logmsg, DefaultTcpListenerHandler, ReactRuntime};
+use reactio::{logerr, DefaultTcpListenerHandler, ReactRuntime};
 mod example;
 
 fn run(port: i32) {
@@ -18,8 +18,8 @@ fn run(port: i32) {
             ),
             reactio::Deferred::Immediate,
             |result| {
-                if let reactio::CommandCompletion::Error(err) = result {
-                    logmsg!("Failed to listen. err: {}", err);
+                if let Err(err) = result {
+                    logerr!("Failed to listen. err: {}", err);
                 }
             },
         )

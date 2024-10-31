@@ -1,4 +1,4 @@
-use reactio::{logmsg, ReactRuntime};
+use reactio::{logerr, ReactRuntime};
 mod example;
 
 fn run(port: i32, max_echos: i32, latency_batch: i32) {
@@ -16,9 +16,9 @@ fn run(port: i32, max_echos: i32, latency_batch: i32) {
                 latency_batch,
             ),
             reactio::Deferred::Immediate,
-            |result| {
-                if let reactio::CommandCompletion::Error(err) = result {
-                    logmsg!("Failed to connect. err: {}", err);
+            |completion| {
+                if let Err(err) = completion {
+                    logerr!("Failed to connect. err: {}", err);
                 }
             },
         )

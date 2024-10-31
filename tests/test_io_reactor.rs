@@ -1,4 +1,4 @@
-#[macro_use(logmsg)]
+#[macro_use(logerr)]
 extern crate reactio;
 
 #[cfg(test)]
@@ -46,6 +46,7 @@ mod test {
             auto_sender.write_fmt(format_args!("test ")).unwrap();
             auto_sender.write_fmt(format_args!("msgsend")).unwrap();
             assert_eq!(auto_sender.count_written(), 12);
+            assert_eq!(auto_sender.get_written(), b"test msgsend");
             // auto_sender.send(None).unwrap(); // this line can be omitted to let it auto send on drop.
             // ctx.send_msg("Hello".as_bytes())?; // rather than using auto_sender, we call ctx to send_msg
             Ok(()) // accept connection
@@ -65,7 +66,7 @@ mod test {
         let timer = reactio::utils::Timer::new_millis(1000);
         while runtime.count_reactors() < 1 {
             if timer.expired() {
-                logmsg!("ERROR: timeout waiting for listener start!");
+                logerr!("ERROR: timeout waiting for listener start!");
                 break;
             }
             runtime.process_events();
@@ -89,7 +90,7 @@ mod test {
         let timer = reactio::utils::Timer::new_millis(1000);
         while runtime.process_events() {
             if timer.expired() {
-                logmsg!("ERROR: timeout waiting for tests to complete!");
+                logerr!("ERROR: timeout waiting for tests to complete!");
                 break;
             }
         }

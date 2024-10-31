@@ -1,7 +1,7 @@
 use crate::dbglog;
 use crate::flat_storage::FlatStorage;
-use crate::logmsg; // import one macro per line. macros are exported at root of crate instead of mod level.
 use crate::utils;
+use crate::{logerr, logtrace};
 use core::panic;
 use polling::{Event, Events, PollMode, Poller};
 use std::io::{ErrorKind, Read, Write};
@@ -129,12 +129,7 @@ pub enum Deferred {
     UtilTime(std::time::SystemTime),
 }
 /// `CommandCompletion` is used as an argument of command completion callback.
-pub enum CommandCompletion {
-    /// Command execution is completed.
-    Completed(ReactorID),
-    /// Command was not executed due to error.
-    Error(String),
-}
+pub type CommandCompletion = Result<ReactorID>;
 
 /// CmdSender is owned by a ReactRuntime. Users send commands to a reactor with specific ReactorID.
 /// * **Note that CmdSender can only send command to a reactor that belongs to the same ReactRuntime.**
@@ -469,7 +464,7 @@ impl<UserCommand> ReactorMgr<UserCommand> {
                     )
                     .unwrap();
             }
-            logmsg!(
+            logtrace!(
                 "Added TcpStream reactorid: {}, sock: {:?}",
                 sockdata.reactorid,
                 sockdata.sock
@@ -503,7 +498,7 @@ impl<UserCommand> ReactorMgr<UserCommand> {
                     .add_with_mode(sock, Event::readable(reactorid.to_usize()), PollMode::Level)
                     .unwrap();
             }
-            logmsg!(
+            logtrace!(
                 "Added TcpListener reactorid: {}, sock: {:?}",
                 reactorid,
                 sock
@@ -519,7 +514,7 @@ impl<UserCommand> ReactorMgr<UserCommand> {
             match sockhandler {
                 TcpSocketHandler::StreamType(sockdata, mut reactor) => {
                     debug_assert_eq!(reactorid, sockdata.reactorid);
-                    logmsg!(
+                    logtrace!(
                         "removing reactorid: {}, sock: {:?}, pending_read_bytes: {}, pending_send_bytes: {}",
                         reactorid,
                         sockdata.sock,
@@ -532,7 +527,7 @@ impl<UserCommand> ReactorMgr<UserCommand> {
                 }
                 TcpSocketHandler::ListenerType(areactorid, sock, mut reactor) => {
                     debug_assert_eq!(reactorid, areactorid);
-                    logmsg!("removing reactorid: {}, sock: {:?}", reactorid, sock);
+                    logtrace!("removing reactorid: {}, sock: {:?}", reactorid, sock);
                     self.poller.delete(&sock).unwrap();
                     (reactor).on_close(reactorid, &self.cmd_sender);
                 }
@@ -685,7 +680,7 @@ impl<UserCommand> ReactRuntime<UserCommand> {
                             // else newsock will auto destroy
                         }
                         if ev.writable {
-                            logmsg!("[ERROR] writable listener sock!");
+                            logerr!("writable listener sock!");
                             removesock = true;
                         }
                     }
@@ -698,7 +693,7 @@ impl<UserCommand> ReactRuntime<UserCommand> {
                             ctx.interested_writable = true; // in case unsolicited event.
                             if !ctx.sender.buf.is_empty() {
                                 if let Err(err) = ctx.sender.send_queued(&mut ctx.sock) {
-                                    logmsg!("{err}  send_queued failed.");
+                                    logtrace!("{err}  send_queued failed.");
                                     removesock = true;
                                 }
                             }
@@ -709,7 +704,7 @@ impl<UserCommand> ReactRuntime<UserCommand> {
                                 &self.mgr.cmd_sender,
                             )) {
                                 if !err.is_empty() {
-                                    logmsg!("on_readable requested close current_reactorid: {current_reactorid}, sock: {:?}. Reason: {}", ctx.sock, err);
+                                    logtrace!("on_readable requested close current_reactorid: {current_reactorid}, sock: {:?}. Reason: {}", ctx.sock, err);
                                 }
                                 removesock = true;
                             }
@@ -766,7 +761,7 @@ impl<UserCommand> ReactRuntime<UserCommand> {
                             Ok(_) => INVALID_REACTOR_ID, // accept it, don't close it.
                             Err(err) => {
                                 if !err.is_empty() {
-                                    logmsg!("Reject new connection for listener_reactorid: {}. Reason: {}", current_reactorid, err);
+                                    logtrace!("Reject new connection for listener_reactorid: {}. Reason: {}", current_reactorid, err);
                                 }
                                 newsockdata.reactorid // close it.
                             }
@@ -787,11 +782,11 @@ impl<UserCommand> ReactRuntime<UserCommand> {
                 continue; // ignore error events.
             }
             if ev.is_err().unwrap_or(false) {
-                logmsg!("WARN: socket error key: {}", current_reactorid);
+                logerr!("WARN: socket error key: {}", current_reactorid);
                 removesock = true;
             }
             if ev.is_interrupt() {
-                logmsg!("WARN: socket interrupt key: {}", current_reactorid);
+                logerr!("WARN: socket interrupt key: {}", current_reactorid);
                 removesock = true;
             }
             if removesock {
@@ -877,10 +872,10 @@ impl<UserCommand> ReactRuntime<UserCommand> {
                     Err(err) => {
                         let errmsg =
                             format!("Failed to connect to {}. Error: {}", remote_addr, err);
-                        (cmddata.completion)(CommandCompletion::Error(errmsg));
+                        (cmddata.completion)(Err(errmsg));
                     }
                     Ok(key) => {
-                        (cmddata.completion)(CommandCompletion::Completed(key));
+                        (cmddata.completion)(Ok(key));
                     }
                 }
             }
@@ -888,18 +883,18 @@ impl<UserCommand> ReactRuntime<UserCommand> {
                 match self.mgr.start_listen(&local_addr, reactor) {
                     Err(err) => {
                         let errmsg = format!("Failed to listen on {}. Error: {}", local_addr, err);
-                        (cmddata.completion)(CommandCompletion::Error(errmsg));
+                        (cmddata.completion)(Err(errmsg));
                     }
                     Ok(key) => {
-                        (cmddata.completion)(CommandCompletion::Completed(key));
+                        (cmddata.completion)(Ok(key));
                     }
                 }
             }
             SysCommand::CloseSocket => {
                 if self.mgr.close_reactor(cmddata.reactorid) {
-                    (cmddata.completion)(CommandCompletion::Completed(cmddata.reactorid));
+                    (cmddata.completion)(Ok(cmddata.reactorid));
                 } else {
-                    (cmddata.completion)(CommandCompletion::Error(format!(
+                    (cmddata.completion)(Err(format!(
                         "Failed to remove non existing socket with reactorid: {}",
                         cmddata.reactorid
                     )));
@@ -915,14 +910,14 @@ impl<UserCommand> ReactRuntime<UserCommand> {
                 {
                     match handler {
                         TcpSocketHandler::ListenerType(reactorid, _, _) => {
-                            (cmddata.completion)(CommandCompletion::Error(format!(
+                            (cmddata.completion)(Err(format!(
                                     "Listener cannot receive user command. cmd reactorid: {}, reactorid: {}",
                                     cmddata.reactorid, *reactorid
                                 )));
                         }
                         TcpSocketHandler::StreamType(ctx, reactor) => {
                             if cmddata.reactorid != ctx.reactorid {
-                                (cmddata.completion)(CommandCompletion::Error(format!(
+                                (cmddata.completion)(Err(format!(
                                         "Failed to execute user command with wrong cmd reactorid: {}, found: {}",
                                         cmddata.reactorid , ctx.reactorid
                                     )));
@@ -936,11 +931,9 @@ impl<UserCommand> ReactRuntime<UserCommand> {
                                         cmd_sender: &self.mgr.cmd_sender,
                                     },
                                 );
-                                (cmddata.completion)(CommandCompletion::Completed(
-                                    cmddata.reactorid,
-                                ));
+                                (cmddata.completion)(Ok(cmddata.reactorid));
                                 if let Err(err) = res {
-                                    logmsg!(
+                                    logtrace!(
                                         "on_command requested closing reactorid: {}. {}",
                                         cmddata.reactorid,
                                         err
@@ -951,7 +944,7 @@ impl<UserCommand> ReactRuntime<UserCommand> {
                         }
                     }
                 } else {
-                    (cmddata.completion)(CommandCompletion::Error(format!(
+                    (cmddata.completion)(Err(format!(
                         "Failed to execute user command on non existing socket with reactorid: {}",
                         cmddata.reactorid
                     )));
@@ -1066,14 +1059,14 @@ impl MsgSender {
                     if errkind == ErrorKind::WouldBlock {
                         return Ok(sentbytes); // queued
                     } else if errkind == ErrorKind::ConnectionReset {
-                        logmsg!("sock reset : {sock:?}. close socket");
+                        logtrace!("sock reset : {sock:?}. close socket");
                         return Err(err);
                     // socket closed
                     } else if errkind == ErrorKind::Interrupted {
-                        logmsg!("[WARN] sock Interrupted : {sock:?}. retry");
+                        logtrace!("[WARN] sock Interrupted : {sock:?}. retry");
                         return Err(err); // Interrupted is not an error. queue
                     } else {
-                        logmsg!("[ERROR]: write on sock {sock:?}, error: {err:?}");
+                        logtrace!("[ERROR]: write on sock {sock:?}, error: {err:?}");
                         return Err(err);
                     }
                 }
@@ -1178,7 +1171,7 @@ impl MsgSender {
                     ));
                 // socket closed
                 } else if errkind == ErrorKind::Interrupted {
-                    logmsg!("[WARN] sock Interrupted : {sock:?}. retry");
+                    logtrace!("[WARN] sock Interrupted : {sock:?}. retry");
                     return Ok(SendOrQueResult::InQueue); // Interrupted is not an error. queue
                 } else {
                     self.close_or_error = true;
@@ -1249,6 +1242,10 @@ impl<'sender> AutoSendBuffer<'sender> {
     }
     pub fn count_written(&self) -> usize {
         self.sender.buf.len() - self.old_buf_size
+    }
+    /// Get the buffer containing the written bytes.
+    pub fn get_written(&self) -> &[u8] {
+        &self.sender.buf[self.old_buf_size..]
     }
     pub fn send(
         &mut self,
@@ -1390,7 +1387,7 @@ impl MsgReader {
                     } else if errkind == ErrorKind::ConnectionReset {
                         return Err("Sock reset".to_owned());
                     } else if errkind == ErrorKind::Interrupted {
-                        logmsg!("[WARN] sock Interrupted : {:?}. retry", ctx.sock);
+                        logtrace!("[WARN] sock Interrupted : {:?}. retry", ctx.sock);
                         return Ok(()); // Interrupted is not an error.
                     } else if errkind == ErrorKind::ConnectionAborted {
                         return Err("Sock ConnectionAborted".to_owned()); // closed by remote (windows)
@@ -1435,7 +1432,7 @@ impl MsgReader {
                         return Err("Sock ConnectionReset".to_owned());
                     // socket closed
                     } else if errkind == ErrorKind::Interrupted {
-                        logmsg!("[WARN] sock Interrupted : {:?}. retry", ctx.sock);
+                        logtrace!("[WARN] sock Interrupted : {:?}. retry", ctx.sock);
                         return Ok(()); // Interrupted is not an error.
                     } else if errkind == ErrorKind::ConnectionAborted {
                         return Err("sock ConnectionAborted".to_owned()); // closed by remote (windows)
@@ -1473,7 +1470,7 @@ impl MsgReader {
                     match res {
                         MessageResult::ExpectMsgSize(msgsize) => {
                             if !(msgsize == 0 || msgsize > self.bufsize - self.startpos) {
-                                logmsg!( "[WARN] on_inbound_message should NOT expect a msgsize while full message is already received, which may cause recursive call. msgsize:{msgsize:?} recved: {}",
+                                logerr!( "[WARN] on_inbound_message should NOT expect a msgsize while full message is already received, which may cause recursive call. msgsize:{msgsize:?} recved: {}",
                             self.bufsize - self.startpos);
                                 debug_assert!(
                                     false,

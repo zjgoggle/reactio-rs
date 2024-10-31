@@ -1,5 +1,5 @@
 use reactio::{
-    dbglog, logmsg, utils, Deferred, DispatchContext, MessageResult, NewServerReactor, Reactor,
+    dbglog, loginfo, utils, Deferred, DispatchContext, MessageResult, NewServerReactor, Reactor,
     ReactorID, Result,
 };
 
@@ -62,7 +62,7 @@ impl Reactor for PingpongReactor {
         cmd: MyUserCommand,
         ctx: &mut DispatchContext<MyUserCommand>,
     ) -> Result<()> {
-        logmsg!("Reactorid {} recv cmd: {}", ctx.reactorid, cmd);
+        loginfo!("Reactorid {} recv cmd: {}", ctx.reactorid, cmd);
         Ok(())
     }
 
@@ -72,7 +72,7 @@ impl Reactor for PingpongReactor {
         listener: ReactorID,
     ) -> Result<()> {
         self.parent_listener = listener;
-        logmsg!("[{}] sock connected: {:?}", self.name, ctx.sock);
+        loginfo!("[{}] sock connected: {:?}", self.name, ctx.sock);
         if self.is_client {
             self.send_msg(ctx, "test msg000")?;
         } else {

@@ -1,4 +1,4 @@
-use crate::{logmsg, CmdSender, ReactRuntime, ReactorID};
+use crate::{logtrace, CmdSender, ReactRuntime, ReactorID};
 use std::sync::{
     atomic::{self, AtomicBool},
     Arc, Mutex,
@@ -53,25 +53,25 @@ impl<UserCommand: 'static> ThreadedReactorMgr<UserCommand> {
             let thread = std::thread::Builder::new()
                 .name(format!("ThreadedReactors-{}", threadid))
                 .spawn(move || {
-                    logmsg!("Entered ThreadedReactors-{}", threadid);
+                    logtrace!("Entered ThreadedReactors-{}", threadid);
                     let mut runtime = ReactRuntime::<UserCommand>::new();
                     tx.send(IDAndSender(threadid, runtime.get_cmd_sender().clone()))
                         .expect("Failed to send in thread");
                     drop(tx);
 
-                    logmsg!("Start polling events in ThreadedReactors-{}", threadid);
+                    logtrace!("Start polling events in ThreadedReactors-{}", threadid);
                     while !stopcmd.load(atomic::Ordering::Acquire) {
                         runtime.process_events();
                         std::thread::yield_now();
                         // MAYDO: update stats: sock_events, commands, deferred_queue_size, count_read_bytes, count_write_bytes
                     }
-                    logmsg!("Exiting ThreadedReactors-{}", threadid);
+                    logtrace!("Exiting ThreadedReactors-{}", threadid);
                 })
                 .unwrap();
             me.threads.push(thread);
         }
 
-        logmsg!("Waiting for thread initializations");
+        logtrace!("Waiting for thread initializations");
         let mut unsorted_senders = Vec::new();
         for _ in 0..nthreads {
             let sender = rx
@@ -84,7 +84,7 @@ impl<UserCommand: 'static> ThreadedReactorMgr<UserCommand> {
             debug_assert_eq!(i, e.0);
             me.senders.push(e);
         }
-        logmsg!("Recved all thread initializations");
+        logtrace!("Recved all thread initializations");
         Arc::new(me)
     }
 

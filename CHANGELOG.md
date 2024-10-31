@@ -1,5 +1,6 @@
 # Version 0.1.7
 - print pending_read_bytes, pending_send_bytes on close.
+- set_log_level, logerr/loginfo/logtrace,
 
 # Version 0.1.6
 - Bugfix: try_dispatch_all; AutoSendBuffer::send.

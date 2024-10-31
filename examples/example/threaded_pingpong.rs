@@ -1,7 +1,7 @@
 use reactio::threaded_reactors::{ReactorUID, ThreadedReactorMgr};
 use reactio::{
-    logmsg, DefaultTcpListenerHandler, Deferred, DispatchContext, MessageResult, NewServerReactor,
-    Reactor, ReactorID, Result,
+    logtrace, DefaultTcpListenerHandler, Deferred, DispatchContext, MessageResult,
+    NewServerReactor, Reactor, ReactorID, Result,
 };
 use std::sync::atomic::{self, AtomicI32};
 use std::sync::Arc;
@@ -37,7 +37,7 @@ impl ThreadedPingpongReactor {
 impl Drop for ThreadedPingpongReactor {
     fn drop(&mut self) {
         self.reactormgr.remove_reactor_name(&self.inner.name);
-        logmsg!("Dropping reactor: {}", self.inner.name);
+        logtrace!("Dropping reactor: {}", self.inner.name);
         self.stopcounter.fetch_add(1, atomic::Ordering::Relaxed);
     }
 }
@@ -74,7 +74,7 @@ impl Reactor for ThreadedPingpongReactor {
         listener: ReactorID,
     ) -> Result<()> {
         self.inner.parent_listener = listener;
-        logmsg!("[{}] connected sock: {:?}", self.inner.name, ctx.sock);
+        logtrace!("[{}] connected sock: {:?}", self.inner.name, ctx.sock);
         // register <name, uid>
         self.reactormgr.add_reactor_uid(
             self.inner.name.clone(),
@@ -120,7 +120,7 @@ impl Reactor for ThreadedPingpongReactor {
         cmd: Self::UserCommand,
         ctx: &mut DispatchContext<Self::UserCommand>,
     ) -> Result<()> {
-        logmsg!("[{}] **Recv user cmd** {}", &self.inner.name, &cmd);
+        logtrace!("[{}] **Recv user cmd** {}", &self.inner.name, &cmd);
         if self.inner.is_client {
             //-- test send cmd to server
             let server_uid = self
@@ -163,7 +163,7 @@ pub fn create_tcp_listener(
 mod test {
     use atomic::AtomicI32;
 
-    use reactio::{utils, CommandCompletion, Deferred};
+    use reactio::{logerr, utils, Deferred};
 
     use super::*;
 
@@ -197,8 +197,8 @@ mod test {
                 Deferred::Immediate,
                 // OnCommandCompletion, when listen socket is ready, send another command to connect from another thread.
                 move |res| {
-                    if let CommandCompletion::Error(_) = res {
-                        logmsg!("[ERROR] Failed to listen exit!");
+                    if let Err(err) = res {
+                        logerr!("[ERROR] Failed to listen. {err}");
                         return;
                     }
                     amgr.get_cmd_sender(threadid1)
@@ -216,8 +216,8 @@ mod test {
                             ),
                             Deferred::Immediate,
                             |res| {
-                                if let CommandCompletion::Error(_) = res {
-                                    logmsg!("[ERROR] Failed connect!");
+                                if let Err(err) = res {
+                                    logerr!("Failed connect! {err}");
                                 }
                             },
                         )
