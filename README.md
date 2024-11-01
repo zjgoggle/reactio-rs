@@ -98,7 +98,7 @@ pub fn test_io_reactor() {
             if count_echos >= max_echos {
                 return Err(format!("Reached max echo: {max_echos}")); // close socket
             }
-            ctx.send_msg(buf)?; // echo back message.
+            ctx.send_or_que(buf)?; // echo back message.
             count_echos += 1;
             Ok(buf.len()) // return number of bytes having been consumed.
         }
@@ -127,7 +127,7 @@ pub fn test_io_reactor() {
         assert_eq!(auto_sender.count_written(), 12);
         assert_eq!(auto_sender.get_written(), b"test msgsend");
         // auto_sender.send(None).unwrap(); // this line can be omitted to let it auto send on drop.
-        // ctx.send_msg("Hello".as_bytes())?; // rather than using auto_sender, we call ctx to send_msg
+        // ctx.send_or_que("Hello".as_bytes())?; // rather than using auto_sender, we call ctx.send_or_que
         Ok(()) // accept connection
     };
 

@@ -138,7 +138,7 @@ impl Reactor for PingpongReactor {
 
         if self.count_echo < self.max_echo {
             self.last_sent_time = utils::cpu_now_nanos();
-            ctx.send_msg(&buf[..msg_size])?;
+            ctx.send_or_que(&buf[..msg_size])?;
 
             self.last_recv_msg.payload.clear();
             self.last_recv_msg
@@ -210,7 +210,7 @@ impl PingpongReactor {
             *header_sendtime = utils::cpu_now_nanos();
         }
 
-        ctx.send_msg(&buf[..(msg.len() + MSG_HEADER_SIZE)])?;
+        ctx.send_or_que(&buf[..(msg.len() + MSG_HEADER_SIZE)])?;
         Ok(())
     }
 }
@@ -234,7 +234,7 @@ impl NewServerReactor for PingpongReactor {
 }
 
 #[cfg(test)]
-mod test {
+mod tests {
     use super::*;
     use reactio::{DefaultTcpListenerHandler, ReactRuntime};
     use ServerParam;

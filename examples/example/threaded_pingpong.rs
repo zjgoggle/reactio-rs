@@ -160,7 +160,7 @@ pub fn create_tcp_listener(
 }
 
 #[cfg(test)]
-mod test {
+mod tests {
     use atomic::AtomicI32;
 
     use reactio::{logerr, utils, Deferred};

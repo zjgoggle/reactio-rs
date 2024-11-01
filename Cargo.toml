@@ -1,6 +1,6 @@
 [package]
 name = "reactio"
-version = "0.1.7"
+version = "0.1.8"
 edition = "2021"
 
 authors = ["Jack Zhang <zjgoggle@gmail.com>"]

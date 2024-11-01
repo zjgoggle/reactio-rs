@@ -1,3 +1,6 @@
+# Version 0.1.8
+- Add SimpleIoService: One Reactor serves mulitple sockets. see test_io_service.
+
 # Version 0.1.7
 - print pending_read_bytes, pending_send_bytes on close.
 - set_log_level, logerr/loginfo/logtrace,

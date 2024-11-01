@@ -9,7 +9,7 @@ use std::time::Duration;
 use std::{marker::PhantomData, net::TcpStream};
 
 //====================================================================================
-//            Reactor, Poller
+//            Reactor
 //====================================================================================
 
 /// A `Reactor` is assigned a unique ReactorID when adding to a ReactRuntime, and is able to receive socket messsages (via reader) and commands.
@@ -61,7 +61,9 @@ pub trait Reactor {
                 sender: ctx.sender,
                 cmd_sender: ctx.cmd_sender,
             },
-            self,
+            &mut |buf, new_bytes, decoded_msg_size, ctx| {
+                self.on_inbound_message(buf, new_bytes, decoded_msg_size, ctx)
+            },
         )
     }
 
@@ -100,9 +102,15 @@ impl<'a, UserCommand> DispatchContext<'a, UserCommand> {
             cmd_sender,
         }
     }
-    pub fn send_msg(&mut self, msg: &[u8]) -> Result<SendOrQueResult> {
+    /// try send until Err, WOULDBLOCK or Complete. No internal buffer is used.
+    /// return number of bytes having sent if not Err.
+    pub fn send_no_que(&mut self, msg: &[u8]) -> std::io::Result<usize> {
+        MsgSender::try_send_all(self.sock, msg)
+    }
+    pub fn send_or_que(&mut self, msg: &[u8]) -> Result<SendOrQueResult> {
         self.sender.send_or_que(self.sock, msg, None)
     }
+    /// write and call send_or_que to send.
     pub fn acquire_send(&mut self) -> AutoSendBuffer<'_> {
         let old_buf_size = self.sender.buf.len();
         AutoSendBuffer {
@@ -262,7 +270,12 @@ pub trait TcpListenerHandler {
     type UserCommand;
 
     /// called when the listen socket starts listeing.
-    fn on_start_listen(&mut self, reactorid: ReactorID, cmd_sender: &CmdSender<Self::UserCommand>);
+    fn on_start_listen(
+        &mut self,
+        _reactorid: ReactorID,
+        _cmd_sender: &CmdSender<Self::UserCommand>,
+    ) {
+    }
 
     //// return (Reactor, recv_buffer_min_size) or None to close the new connection.
     fn on_new_connection(
@@ -271,7 +284,12 @@ pub trait TcpListenerHandler {
         new_sock: &mut std::net::TcpStream,
     ) -> Option<NewStreamConnection<Self::UserCommand>>;
 
-    fn on_close(&mut self, _reactorid: ReactorID, _cmd_sender: &CmdSender<Self::UserCommand>) {}
+    fn on_close_listen(
+        &mut self,
+        _reactorid: ReactorID,
+        _cmd_sender: &CmdSender<Self::UserCommand>,
+    ) {
+    }
 }
 pub struct NewStreamConnection<UserCommand> {
     pub reactor: Box<dyn Reactor<UserCommand = UserCommand>>,
@@ -529,7 +547,7 @@ impl<UserCommand> ReactorMgr<UserCommand> {
                     debug_assert_eq!(reactorid, areactorid);
                     logtrace!("removing reactorid: {}, sock: {:?}", reactorid, sock);
                     self.poller.delete(&sock).unwrap();
-                    (reactor).on_close(reactorid, &self.cmd_sender);
+                    (reactor).on_close_listen(reactorid, &self.cmd_sender);
                 }
             }
             return true;
@@ -997,7 +1015,7 @@ unsafe impl<UserCommand> Send for CmdData<UserCommand> {}
 /// Mixed using of both may cause out-of-order messages.
 pub struct MsgSender {
     pub buf: Vec<u8>,
-    pub pending: FlatStorage<PendingSend>, // Each PendingSend represents a send_msg action.
+    pub pending: FlatStorage<PendingSend>, // Each PendingSend represents a send_or_que action.
     first_pending_id: usize, // the id in flat_storage, usize::MAX is invalid. pop from front.
     last_pending_id: usize,  // the id in flat_storage, usize::MAX is invalid. push to back.
     pub bytes_sent: usize,   // total bytes having been sent. buf[0] is bytes_sent+1 byte to send.
@@ -1011,7 +1029,7 @@ pub struct PendingSend {
     completion: Box<dyn FnOnce()>, // notify write completion.
 }
 
-/// `SendOrQueResult` is the result of `MsgSender::send_or_que` or `DispatchContext::send_msg`.
+/// `SendOrQueResult` is the result of `MsgSender::send_or_que` or `DispatchContext::send_or_que`.
 #[derive(PartialEq, Eq)]
 pub enum SendOrQueResult {
     /// No message in queue
@@ -1350,7 +1368,13 @@ impl MsgReader {
     pub fn try_read_fast_dispatch<UserCommand>(
         &mut self,
         ctx: &mut DispatchContext<UserCommand>,
-        dispatcher: &mut (impl Reactor<UserCommand = UserCommand> + ?Sized),
+        // dispatcher: &mut (impl Reactor<UserCommand = UserCommand> + ?Sized),
+        dispatcher: &mut impl FnMut(
+            &mut [u8],
+            usize,
+            usize,
+            &mut DispatchContext<UserCommand>,
+        ) -> Result<MessageResult>,
     ) -> Result<()> {
         loop {
             debug_assert!(
@@ -1449,14 +1473,20 @@ impl MsgReader {
         &mut self,
         new_bytes: usize,
         ctx: &mut DispatchContext<UserCommand>,
-        dispatcher: &mut (impl Reactor<UserCommand = UserCommand> + ?Sized),
+        // dispatcher: &mut (impl Reactor<UserCommand = UserCommand> + ?Sized),
+        dispatcher: &mut impl FnMut(
+            &mut [u8],
+            usize,
+            usize,
+            &mut DispatchContext<UserCommand>,
+        ) -> Result<MessageResult>,
     ) -> Result<()> {
         let mut new_bytes = new_bytes;
         // loop while: buf_not_empty and ( partial_header or partial_msg )
         while self.startpos < self.bufsize
             && (self.decoded_msgsize == 0 || self.startpos + self.decoded_msgsize <= self.bufsize)
         {
-            match dispatcher.on_inbound_message(
+            match dispatcher(
                 &mut self.recv_buffer[self.startpos..self.bufsize],
                 new_bytes,
                 self.decoded_msgsize,
@@ -1503,7 +1533,13 @@ impl MsgReader {
     pub fn try_read_fast_read<UserCommand>(
         &mut self,
         ctx: &mut DispatchContext<UserCommand>,
-        dispatcher: &mut (impl Reactor<UserCommand = UserCommand> + ?Sized),
+        // dispatcher: &mut (impl Reactor<UserCommand = UserCommand> + ?Sized),
+        dispatcher: &mut impl FnMut(
+            &mut [u8],
+            usize,
+            usize,
+            &mut DispatchContext<UserCommand>,
+        ) -> Result<MessageResult>,
     ) -> Result<()> {
         let old_bytes = self.bufsize - self.startpos;
         let res = self.try_read_all(ctx);
@@ -1580,62 +1616,66 @@ impl<NewReactor: NewServerReactor + 'static> TcpListenerHandler
 }
 
 //====================================================================================
-//            SimpleIoReactor, SimpleIoListener, CommandReactor
+//            SimpleIoReactor, SimpleIoListener
 //====================================================================================
 
 pub type SimpleIoRuntime = ReactRuntime<()>;
 pub type SimpleIoReactorContext<'a> = DispatchContext<'a, ()>;
 pub type DynIoReactor = dyn Reactor<UserCommand = ()>;
 
-type OnConnectedHandler = dyn FnMut(
+type OnConnectedHandler<AppData> = dyn FnMut(
     &mut SimpleIoReactorContext<'_>,
     ReactorID, // parent listener reactorid.
+    &mut AppData,
 ) -> Result<()>;
 
-type OnClosedHandler = dyn FnMut(ReactorID, &CmdSender<()>);
+type OnClosedHandler<AppData> = dyn FnMut(ReactorID, &CmdSender<()>, &mut AppData);
 
-type OnSockMsgHandler = dyn FnMut(&mut [u8], &mut SimpleIoReactorContext<'_>) -> Result<usize>;
-
-type CmdHandler<UserCommand> =
-    dyn FnMut(UserCommand, &mut DispatchContext<'_, UserCommand>) -> Result<()>;
+type OnSockMsgHandler<AppData> =
+    dyn FnMut(&mut [u8], &mut SimpleIoReactorContext<'_>, &mut AppData) -> Result<usize>;
 
 /// `SimpleIoReactor` doesn't have `UserCommand`. User supplies callback functions to handle inbound socket messages and on_connected/on_close events.
 /// On each readable socket event, the MsgReader reads all data and call on_sock_msg_handler to dispatch message.
 ///
 /// **Note that SimpleIoReactor can only be used with SimpleIoRuntime
-pub struct SimpleIoReactor {
-    on_connected_handler: Option<Box<OnConnectedHandler>>,
-    on_closed_handler: Option<Box<OnClosedHandler>>,
+pub struct SimpleIoReactor<AppData> {
+    app_data: AppData,
+    on_connected_handler: Option<Box<OnConnectedHandler<AppData>>>,
+    on_closed_handler: Option<Box<OnClosedHandler<AppData>>>,
     /// msg_handler returns Err to close socket. else, returns Ok(dropMsgSize);
-    on_sock_msg_handler: Box<OnSockMsgHandler>,
+    on_sock_msg_handler: Box<OnSockMsgHandler<AppData>>,
 }
-impl SimpleIoReactor {
+impl<AppData: 'static> SimpleIoReactor<AppData> {
     pub fn new(
-        on_connected_handler: Option<Box<OnConnectedHandler>>,
-        on_closed_handler: Option<Box<OnClosedHandler>>,
-        on_sock_msg_handler: impl FnMut(&mut [u8], &mut SimpleIoReactorContext<'_>) -> Result<usize>
+        app_data: AppData,
+        on_connected_handler: Option<Box<OnConnectedHandler<AppData>>>,
+        on_closed_handler: Option<Box<OnClosedHandler<AppData>>>,
+        on_sock_msg_handler: impl FnMut(&mut [u8], &mut SimpleIoReactorContext<'_>, &mut AppData) -> Result<usize>
             + 'static,
     ) -> Self {
         Self {
+            app_data,
             on_connected_handler,
             on_closed_handler,
             on_sock_msg_handler: Box::new(on_sock_msg_handler),
         }
     }
     pub fn new_boxed(
-        on_connected_handler: Option<Box<OnConnectedHandler>>,
-        on_closed_handler: Option<Box<OnClosedHandler>>,
-        on_sock_msg_handler: impl FnMut(&mut [u8], &mut SimpleIoReactorContext<'_>) -> Result<usize>
+        app_data: AppData,
+        on_connected_handler: Option<Box<OnConnectedHandler<AppData>>>,
+        on_closed_handler: Option<Box<OnClosedHandler<AppData>>>,
+        on_sock_msg_handler: impl FnMut(&mut [u8], &mut SimpleIoReactorContext<'_>, &mut AppData) -> Result<usize>
             + 'static,
     ) -> Box<dyn Reactor<UserCommand = ()>> {
-        Box::new(Self {
+        Box::new(Self::new(
+            app_data,
             on_connected_handler,
             on_closed_handler,
-            on_sock_msg_handler: Box::new(on_sock_msg_handler),
-        })
+            on_sock_msg_handler,
+        ))
     }
 }
-impl Reactor for SimpleIoReactor {
+impl<AppData> Reactor for SimpleIoReactor<AppData> {
     type UserCommand = ();
 
     fn on_inbound_message(
@@ -1645,7 +1685,7 @@ impl Reactor for SimpleIoReactor {
         _decoded_msg_size: usize,
         ctx: &mut DispatchContext<Self::UserCommand>,
     ) -> Result<MessageResult> {
-        let drop_msg_size = (self.on_sock_msg_handler)(buf, ctx)?;
+        let drop_msg_size = (self.on_sock_msg_handler)(buf, ctx, &mut self.app_data)?;
         Ok(MessageResult::DropMsgSize(drop_msg_size)) // drop all all messages.
     }
     fn on_connected(
@@ -1654,13 +1694,13 @@ impl Reactor for SimpleIoReactor {
         listener: ReactorID,
     ) -> Result<()> {
         if let Some(ref mut h) = self.on_connected_handler {
-            return (h)(ctx, listener);
+            return (h)(ctx, listener, &mut self.app_data);
         }
         Ok(()) // accept the connection by default.
     }
     fn on_close(&mut self, reactorid: ReactorID, cmd_sender: &CmdSender<Self::UserCommand>) {
         if let Some(ref mut h) = self.on_closed_handler {
-            (h)(reactorid, cmd_sender)
+            (h)(reactorid, cmd_sender, &mut self.app_data)
         }
     }
 }
@@ -1682,6 +1722,15 @@ impl SimpleIoListener {
             reactorid: INVALID_REACTOR_ID,
             recv_buffer_min_size,
             reactor_creator: Box::new(reactor_creator),
+        }
+    }
+
+    pub fn new_with_io_service<AppData: 'static>(service: SimpleIoService<AppData>) -> Self {
+        Self {
+            count_children: 0,
+            reactorid: INVALID_REACTOR_ID,
+            recv_buffer_min_size: 0, // per socket recv buffer is not used.
+            reactor_creator: Box::new(move |_| Some(Box::new(service.clone()))),
         }
     }
 }
@@ -1708,22 +1757,103 @@ impl TcpListenerHandler for SimpleIoListener {
     }
 }
 
-/// `CommandReactor` doesn't have associated sockets, so only process commands by calling cmd_handler.
-pub struct CommandReactor<UserCommand> {
-    cmd_handler: Box<CmdHandler<UserCommand>>,
+//====================================================================================
+//            SimpleIoService: serves multiple socks per instance.
+//====================================================================================
+
+/// A SimpleIoService instance serves multiple sockets, which diffs from SimpleIoReactor/SimpleIoListener that serves a socket per instance.
+/// See `test_io_service`
+pub struct SimpleIoService<AppData> {
+    inner: std::rc::Rc<std::cell::RefCell<IoServiceInner<AppData>>>,
 }
-impl<UserCommand> CommandReactor<UserCommand> {
-    pub fn new(
-        cmd_handler: impl FnMut(UserCommand, &mut DispatchContext<'_, UserCommand>) -> Result<()>
-            + 'static,
-    ) -> Self {
+
+pub struct IoServiceInner<AppData> {
+    stream_reactor: SimpleIoReactor<AppData>,
+    msg_reader: MsgReader, // do not use the runtime provided reader (each socket has a reader). use this shared one.
+}
+
+impl<AppData> IoServiceInner<AppData> {
+    // The outer call this function to override default impl.
+    fn on_readable(&mut self, ctx: &mut ReactorReableContext<()>) -> Result<()> {
+        self.msg_reader.try_read_fast_read(
+            &mut DispatchContext {
+                reactorid: ctx.reactorid,
+                sock: ctx.sock,
+                sender: ctx.sender,
+                cmd_sender: ctx.cmd_sender,
+            },
+            &mut |buf, new_bytes, decoded_msg_size, ctx| {
+                self.stream_reactor
+                    .on_inbound_message(buf, new_bytes, decoded_msg_size, ctx)
+            },
+        )
+    }
+}
+impl<AppData> Clone for SimpleIoService<AppData> {
+    fn clone(&self) -> Self {
         Self {
-            cmd_handler: Box::new(cmd_handler),
+            inner: std::rc::Rc::clone(&self.inner),
         }
     }
 }
-impl<UserCommand> Reactor for CommandReactor<UserCommand> {
-    type UserCommand = UserCommand;
+impl<AppData: 'static> SimpleIoService<AppData> {
+    pub fn new(
+        recv_buf_min_size: usize,
+        app_data: AppData,
+        on_connected_handler: Option<Box<OnConnectedHandler<AppData>>>,
+        on_closed_handler: Option<Box<OnClosedHandler<AppData>>>,
+        on_sock_msg_handler: impl FnMut(&mut [u8], &mut SimpleIoReactorContext<'_>, &mut AppData) -> Result<usize>
+            + 'static,
+    ) -> Self {
+        Self {
+            inner: std::rc::Rc::new(std::cell::RefCell::new(IoServiceInner::<AppData> {
+                stream_reactor: SimpleIoReactor::<AppData>::new(
+                    app_data,
+                    on_connected_handler,
+                    on_closed_handler,
+                    on_sock_msg_handler,
+                ),
+                msg_reader: MsgReader::new(recv_buf_min_size),
+            })),
+        }
+    }
+
+    pub fn new_boxed(
+        recv_buf_min_size: usize,
+        app_data: AppData,
+        on_connected_handler: Option<Box<OnConnectedHandler<AppData>>>,
+        on_closed_handler: Option<Box<OnClosedHandler<AppData>>>,
+        on_sock_msg_handler: impl FnMut(&mut [u8], &mut SimpleIoReactorContext<'_>, &mut AppData) -> Result<usize>
+            + 'static,
+    ) -> Box<dyn Reactor<UserCommand = ()>> {
+        Box::new(Self::new(
+            recv_buf_min_size,
+            app_data,
+            on_connected_handler,
+            on_closed_handler,
+            on_sock_msg_handler,
+        ))
+    }
+
+    /// call func(app_data) if current service is borrowed. else return Err()
+    pub fn apply_app_data(&self, func: impl FnOnce(&AppData)) -> Result<()> {
+        if let Ok(v) = self.inner.try_borrow() {
+            func(&v.stream_reactor.app_data);
+            return Ok(());
+        }
+        Err("Unable to borrow SimpleIoService".to_owned())
+    }
+    pub fn apply_app_data_mut(&self, func: impl FnOnce(&mut AppData)) -> Result<()> {
+        if let Ok(mut v) = self.inner.try_borrow_mut() {
+            func(&mut v.stream_reactor.app_data);
+            return Ok(());
+        }
+        Err("Unable to borrow SimpleIoService".to_owned())
+    }
+}
+
+impl<AppData> Reactor for SimpleIoService<AppData> {
+    type UserCommand = ();
 
     fn on_inbound_message(
         &mut self,
@@ -1732,24 +1862,39 @@ impl<UserCommand> Reactor for CommandReactor<UserCommand> {
         _decoded_msg_size: usize,
         _ctx: &mut DispatchContext<Self::UserCommand>,
     ) -> Result<MessageResult> {
-        panic!("CommandReactor should not have any associated sockets.");
+        panic!("IoServiceInner handles on_inbound_message. this function should not be called!");
     }
-    fn on_command(
+    /// Override the default implemention. Use shared MsgReader.
+    fn on_readable(&mut self, ctx: &mut ReactorReableContext<Self::UserCommand>) -> Result<()> {
+        self.inner.borrow_mut().on_readable(ctx)
+    }
+
+    fn on_connected(
         &mut self,
-        cmd: Self::UserCommand,
         ctx: &mut DispatchContext<Self::UserCommand>,
+        listener: ReactorID,
     ) -> Result<()> {
-        (self.cmd_handler)(cmd, ctx)
+        self.inner
+            .borrow_mut()
+            .stream_reactor
+            .on_connected(ctx, listener)
+    }
+    fn on_close(&mut self, reactorid: ReactorID, cmd_sender: &CmdSender<Self::UserCommand>) {
+        self.inner
+            .borrow_mut()
+            .stream_reactor
+            .on_close(reactorid, cmd_sender);
     }
 }
 
 #[cfg(test)]
-mod test {
+mod tests {
 
     static EMPTY_COMPLETION_FUNC: fn() = || {};
     fn is_empty_function(_fun: &(dyn Fn() + 'static)) -> Option<Box<dyn Fn() + 'static>> {
         // if std::ptr::eq(fun, &EMPTY_COMPLETION_FUNC as &dyn Fn()) {
         // return None;
+
         // }
         None
         // Some(Box::new((*fun).clone())) // No way to clone Fn()
