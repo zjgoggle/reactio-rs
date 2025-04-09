@@ -38,8 +38,7 @@ pub trait Reactor {
     /// * `buf`  - The buffer containing all the received bytes
     /// * `new_bytes` - Number of new received bytes, which are also bytes that are not processed. If previously on_inbound_message returned DropMsgSize. new_bytes is the remaining bytes.
     /// * `decoded_msg_size` -  the decoded message size which is return value of previous call of on_inbound_message. 0 means message having not been decoded.
-    /// * return ExpectMsgSize(msgsize) to indicate more read until full msgsize is read then call next dispatch. msgsize==0 indicates msg size is unknown.
-    ///         DropMsgSize(msgsize) to indiciate message is processed already. framework can drop the message after call. then msgsize will be 0 again.
+    /// * return ExpectMsgSize(msgsize) to indicate more read until full msgsize is read then call next dispatch. msgsize==0 indicates msg size is unknown. DropMsgSize(msgsize) to indiciate message is processed already. framework can drop the message after call. then msgsize will be 0 again.
     /// * **Note that when calling on_inbound_message(decoded_msg_size) -> ExpectMsgSize(expect_msg_size), if expect_msg_size!=0, it should be always > msg_size.**
     fn on_inbound_message(
         &mut self,
@@ -1253,7 +1252,7 @@ pub struct AutoSendBuffer<'sender> {
     sock: &'sender mut std::net::TcpStream,
     old_buf_size: usize,
 }
-impl<'sender> AutoSendBuffer<'sender> {
+impl AutoSendBuffer<'_> {
     // clear all unsent bytes.
     pub fn clear(&mut self) {
         self.sender.buf.resize(self.old_buf_size, 0);
@@ -1311,12 +1310,12 @@ impl<'sender> AutoSendBuffer<'sender> {
         Ok(SendOrQueResult::InQueue)
     }
 }
-impl<'sender> Drop for AutoSendBuffer<'sender> {
+impl Drop for AutoSendBuffer<'_> {
     fn drop(&mut self) {
         self.send(None).unwrap(); // send on drop
     }
 }
-impl<'sender> std::io::Write for AutoSendBuffer<'sender> {
+impl std::io::Write for AutoSendBuffer<'_> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         self.sender.buf.extend_from_slice(buf);
         Ok(buf.len())
@@ -1633,6 +1632,19 @@ type OnClosedHandler<AppData> = dyn FnMut(ReactorID, &CmdSender<()>, &mut AppDat
 
 type OnSockMsgHandler<AppData> =
     dyn FnMut(&mut [u8], &mut SimpleIoReactorContext<'_>, &mut AppData) -> Result<usize>;
+
+enum DecodeResult<DecodedInfo> {
+    /// Unknown MsgSize (partial header). Continue to call decoder next time.
+    UnknownMsgSize,
+    /// decoded header, waiting for framework to read content then dispatch full message together with buffer.
+    MsgSize(usize, DecodedInfo),
+}
+/// Decode inbound message. SockMsgDecoder(buf: &mut [u8], new_bytes) -> Result<DecodeResult<DecodedInfo>>;
+type SockMsgDecoder<DecodedInfo> = dyn FnMut(&mut [u8], usize) -> Result<DecodeResult<DecodedInfo>>;
+
+fn null_msg_decoder(buf: &mut [u8], _new_bytes: usize) -> Result<DecodeResult<()>> {
+    Ok(DecodeResult::MsgSize(buf.len(), ()))
+}
 
 /// `SimpleIoReactor` doesn't have `UserCommand`. User supplies callback functions to handle inbound socket messages and on_connected/on_close events.
 /// On each readable socket event, the MsgReader reads all data and call on_sock_msg_handler to dispatch message.
